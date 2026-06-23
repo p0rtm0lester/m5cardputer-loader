@@ -1,23 +1,16 @@
-# M5Cardputer Loader partition table  (ESP32-S3, 8MB / 0x800000 flash)
-# ---------------------------------------------------------------------
-#  nvs_ldr : LOADER's own config (wifi, brightness, last-fw). Isolated.
-#  bootflag: 1 sector the loader sets to request a one-shot boot of ota_0.
-#            The custom bootloader hook reads it: if set -> boot ota_0 once
-#            and clear it; if not set -> wipe otadata so the LOADER (factory)
-#            always boots. This defeats app self-validation (e.g. Bruce),
-#            so RESET always returns to the loader.
-#  otadata : boot selection.
-#  factory : the LOADER firmware. Always the boot target unless bootflag set.
-#  ota_0   : the runtime slot (selected firmware copied here, then run).
-#  nvs     : the APP's NVS  (snapshotted per-firmware to /firmware/data/<fw>/).
-#  spiffs  : the APP's FS   (snapshotted per-firmware).
-#  coredump: crash dumps.
+# M5Cardputer Loader partition table  (ESP32-S3, 8MB / 0x800000)
+# Fixed layout: ota_0 holds the launched app; spiffs is sized (1.5MB) to hold
+# the data partition that apps like Marauder bundle. Launch writes via the
+# Update/esp_partition APIs (raw esp_flash_* crashes under Arduino), so the
+# table is NOT rewritten at runtime — it must fit the apps we run.
+#   ota_0  4.5MB  -> fits Bruce/NEMO/Marauder/most (NOT Doom-class >4.5MB)
+#   spiffs 1.5MB  -> matches Marauder's SPIFFS image exactly
 # Name,     Type, SubType,  Offset,    Size
 nvs_ldr,    data, nvs,      0x9000,    0x4000
 bootflag,   data, 0x40,     0xd000,    0x1000
 otadata,    data, ota,      0xe000,    0x2000
 factory,    app,  factory,  0x10000,   0x160000
-ota_0,      app,  ota_0,    0x170000,  0x610000
-nvs,        data, nvs,      0x780000,  0x6000
-spiffs,     data, spiffs,   0x786000,  0x6a000
+ota_0,      app,  ota_0,    0x170000,  0x480000
+spiffs,     data, spiffs,   0x5f0000,  0x180000
+nvs,        data, nvs,      0x770000,  0x6000
 coredump,   data, coredump, 0x7f0000,  0x10000
