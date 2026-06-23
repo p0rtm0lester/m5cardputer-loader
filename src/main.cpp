@@ -1,0 +1,986 @@
+// =====================================================================
+//  M5Cardputer Loader
+//  ---------------------------------------------------------------------
+//  A resident firmware launcher for the M5Cardputer (ESP32-S3, 8MB).
+//
+//  Features
+//    * Simple scrollable list UI driven by the Cardputer keyboard.
+//    * Launch firmwares stored as .bin files on the microSD card
+//      (/firmware/*.bin). The chosen file is streamed into the ota_0
+//      partition and the device reboots into it.
+//    * OTA installer: download a .bin from a URL (read from
+//      /firmware/ota.txt, or typed in) straight into ota_0 over WiFi.
+//    * Settings: WiFi credentials (saved to NVS), screen brightness,
+//      SD rescan, and info.
+//
+//  Controls (Cardputer keyboard)
+//    ;  = up        .  = down        ENTER = select
+//    `  = back/exit (also BACKSPACE)
+//
+//  See README.md for the partition scheme and the return-to-loader
+//  mechanism.
+// =====================================================================
+
+#include <M5Cardputer.h>
+#include <SD.h>
+#include <SPI.h>
+#include <Update.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <vector>
+#include "esp_ota_ops.h"
+
+// ---- M5Cardputer microSD pins (from the hardware spec) --------------
+static const int SD_SCK  = 40;   // G40 CLK
+static const int SD_MISO = 39;   // G39 MISO
+static const int SD_MOSI = 14;   // G14 MOSI
+static const int SD_CS   = 12;   // G12 CS
+
+// ---- Display geometry ------------------------------------------------
+static const int SCR_W = 240;
+static const int SCR_H = 135;
+static const int HDR_H = 18;
+static const int ROW_H = 20;
+static const int FTR_H = 14;
+static const int LIST_Y = HDR_H + 2;
+static const int VISIBLE_ROWS = (SCR_H - HDR_H - FTR_H - 2) / ROW_H;  // ~5 rows
+
+// ---- Colors ----------------------------------------------------------
+#define COL_BG     TFT_BLACK
+#define COL_HDR    0x051D      // deep blue
+#define COL_HDRTXT TFT_WHITE
+#define COL_TXT    TFT_WHITE
+#define COL_DIM    TFT_DARKGREY
+#define COL_SEL    0xFD20      // orange
+#define COL_SELTXT TFT_BLACK
+#define COL_OK     TFT_GREEN
+#define COL_ERR    TFT_RED
+
+#define FW_DIR   "/firmware"
+#define CAT_TSV  "/firmware/_m5cat.tsv"     // cached slim M5Burner catalog (name<TAB>version<TAB>file)
+#define M5B_LIST "https://m5burner-api.m5stack.com/api/firmware"
+#define M5B_CDN  "https://m5burner-cdn.m5stack.com/firmware/"
+#define M5B_CAT  "cardputer"                 // M5Burner category to filter on
+
+static Preferences prefs;
+static auto& dsp = M5Cardputer.Display;
+static M5Canvas cv(&dsp);          // off-screen frame buffer (double buffering -> no flicker)
+static bool sdOK = false;
+
+// Font sizes (LovyanGFX supports fractional scaling): list/messages a touch
+// under 2 for a slightly smaller look; footer hints at 1 so they fit.
+static const float FONT_BIG = 1.7f;
+static const int   FONT_SMALL = 1;
+
+// Power / auto-dim state
+static uint32_t lastActivity = 0;
+static bool     dimmed = false;
+static uint32_t g_dimMs = 0;       // 0 = auto-dim off
+static uint8_t  g_bright = 128;
+
+// =====================================================================
+//  Navigation input
+// =====================================================================
+enum Nav { N_NONE, N_UP, N_DOWN, N_ENTER, N_BACK };
+
+static Nav pollNav() {
+    M5Cardputer.update();
+    bool changed = M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed();
+    if (changed) {
+        lastActivity = millis();
+        if (dimmed) { dsp.setBrightness(g_bright); dimmed = false; return N_NONE; }  // first key just wakes
+    } else {
+        if (g_dimMs && !dimmed && millis() - lastActivity > g_dimMs) { dsp.setBrightness(8); dimmed = true; }
+        return N_NONE;
+    }
+    auto st = M5Cardputer.Keyboard.keysState();
+    if (st.enter) return N_ENTER;
+    if (st.del)   return N_BACK;            // backspace = back
+    for (char c : st.word) {
+        switch (c) {
+            case ';': return N_UP;          // up arrow key
+            case '.': return N_DOWN;        // down arrow key
+            case '`': return N_BACK;        // esc / back
+        }
+    }
+    return N_NONE;
+}
+
+// =====================================================================
+//  Low-level drawing helpers
+// =====================================================================
+// All helpers compose into the off-screen canvas `cv`; callers blit once
+// with cv.pushSprite(0,0). This double-buffering removes the flicker that
+// came from clearing the live display every frame.
+static void drawHeader(const char* title) {
+    cv.fillRect(0, 0, SCR_W, HDR_H, COL_HDR);
+    cv.setTextColor(COL_HDRTXT, COL_HDR);
+    cv.setTextDatum(middle_left);
+    cv.setTextSize(FONT_BIG);
+    cv.drawString(title, 4, HDR_H / 2);
+    // battery indicator (shown on every screen that has a header)
+    int lvl = M5Cardputer.Power.getBatteryLevel();
+    if (lvl >= 0) {
+        bool chg = M5Cardputer.Power.isCharging();
+        cv.setTextDatum(middle_right);
+        cv.setTextSize(FONT_SMALL);
+        cv.setTextColor(chg ? COL_OK : COL_HDRTXT, COL_HDR);
+        cv.drawString((chg ? "+" : "") + String(lvl) + "%", SCR_W - 3, HDR_H / 2);
+    }
+}
+
+static void drawFooter(const char* hint) {
+    cv.fillRect(0, SCR_H - FTR_H, SCR_W, FTR_H, COL_HDR);
+    cv.setTextColor(COL_HDRTXT, COL_HDR);
+    cv.setTextDatum(middle_left);
+    cv.setTextSize(FONT_SMALL);
+    cv.drawString(hint, 4, SCR_H - FTR_H / 2 - 1);
+}
+
+// Centered status message screen; optional pause.
+static void screenMsg(const char* line1, const char* line2 = nullptr,
+                      uint16_t color = COL_TXT, uint32_t holdMs = 0) {
+    cv.fillScreen(COL_BG);
+    cv.setTextColor(color, COL_BG);
+    cv.setTextDatum(middle_center);
+    cv.setTextSize(FONT_BIG);
+    cv.drawString(line1, SCR_W / 2, SCR_H / 2 - (line2 ? 12 : 0));
+    if (line2) { cv.setTextSize(FONT_SMALL); cv.drawString(line2, SCR_W / 2, SCR_H / 2 + 14); }
+    cv.pushSprite(0, 0);
+    if (holdMs) delay(holdMs);
+}
+
+static void drawProgressBar(const char* label, size_t cur, size_t total) {
+    static int lastPct = -1;
+    int pct = total ? (int)((cur * 100) / total) : 0;
+    if (pct == lastPct) return;
+    lastPct = pct;
+    cv.fillScreen(COL_BG);
+    cv.setTextColor(COL_TXT, COL_BG);
+    cv.setTextDatum(middle_center);
+    cv.setTextSize(FONT_BIG);
+    cv.drawString(label, SCR_W / 2, 36);
+    int bx = 20, by = 66, bw = SCR_W - 40, bh = 20;
+    cv.drawRect(bx, by, bw, bh, COL_TXT);
+    cv.fillRect(bx + 2, by + 2, (bw - 4) * pct / 100, bh - 4, COL_SEL);
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d%%", pct);
+    cv.drawString(buf, SCR_W / 2, by + bh + 14);
+    cv.pushSprite(0, 0);
+}
+
+// =====================================================================
+//  Generic scrollable list menu.
+//  Returns selected index, or -1 if the user pressed BACK.
+// =====================================================================
+static int listMenu(const char* title, const std::vector<String>& items,
+                    const char* footer, int start = 0) {
+    int sel = start;
+    int top = 0;
+    bool redraw = true;
+    if (items.empty()) {
+        screenMsg(title, "(empty) - press ` to go back");
+        while (pollNav() != N_BACK) delay(10);
+        return -1;
+    }
+    for (;;) {
+        if (sel < top) top = sel;
+        if (sel >= top + VISIBLE_ROWS) top = sel - VISIBLE_ROWS + 1;
+
+        if (redraw) {
+            cv.fillScreen(COL_BG);
+            drawHeader(title);
+            cv.setTextSize(FONT_BIG);
+            for (int i = 0; i < VISIBLE_ROWS && (top + i) < (int)items.size(); i++) {
+                int idx = top + i;
+                int y = LIST_Y + i * ROW_H;
+                bool on = (idx == sel);
+                if (on) cv.fillRect(0, y, SCR_W, ROW_H, COL_SEL);
+                cv.setTextColor(on ? COL_SELTXT : COL_TXT, on ? COL_SEL : COL_BG);
+                cv.setTextDatum(middle_left);
+                String row = items[idx];
+                if (row.length() > 22) row = row.substring(0, 21) + "~";   // ~23 chars fit at 1.7x
+                cv.drawString(row, 6, y + ROW_H / 2);
+            }
+            // scroll indicator
+            if ((int)items.size() > VISIBLE_ROWS) {
+                int trackY = LIST_Y, trackH = VISIBLE_ROWS * ROW_H;
+                int knobH = trackH * VISIBLE_ROWS / items.size();
+                int knobY = trackY + trackH * top / items.size();
+                cv.fillRect(SCR_W - 3, trackY, 3, trackH, COL_DIM);
+                cv.fillRect(SCR_W - 3, knobY, 3, knobH, COL_SEL);
+            }
+            drawFooter(footer);
+            cv.pushSprite(0, 0);
+            redraw = false;
+        }
+
+        Nav n = pollNav();
+        switch (n) {
+            case N_UP:    sel = (sel - 1 + items.size()) % items.size(); redraw = true; break;
+            case N_DOWN:  sel = (sel + 1) % items.size();                redraw = true; break;
+            case N_ENTER: return sel;
+            case N_BACK:  return -1;
+            default: break;
+        }
+        delay(8);
+    }
+}
+
+// =====================================================================
+//  On-screen text entry (for WiFi credentials / URLs).
+//  Returns false if cancelled (BACK on empty).
+// =====================================================================
+static bool textInput(const char* title, String& out, bool mask = false) {
+    String buf = out;
+    for (;;) {
+        cv.fillScreen(COL_BG);
+        drawHeader(title);
+        cv.setTextColor(COL_TXT, COL_BG);
+        cv.setTextDatum(top_left);
+        cv.setTextSize(FONT_BIG);
+        String shown = buf;
+        if (mask) { shown = ""; for (size_t i = 0; i < buf.length(); i++) shown += '*'; }
+        // wrap manually (char cell ~10x14 at 1.7x)
+        int x = 6, y = LIST_Y + 4;
+        for (int i = 0; i < (int)shown.length(); i++) {
+            cv.drawChar(shown[i], x, y);
+            x += 10;
+            if (x > SCR_W - 14) { x = 6; y += 16; }
+        }
+        cv.fillRect(x, y, 8, 14, COL_SEL);  // cursor
+        drawFooter("type  ENTER=ok  `=cancel");
+        cv.pushSprite(0, 0);
+
+        // read keys
+        M5Cardputer.update();
+        if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
+            auto st = M5Cardputer.Keyboard.keysState();
+            if (st.enter) { out = buf; return true; }
+            if (st.del && buf.length()) buf.remove(buf.length() - 1);
+            for (char c : st.word) {
+                if (c == '`') { return false; }       // cancel
+                if (c >= 32 && c < 127) buf += c;
+            }
+        }
+        delay(10);
+    }
+}
+
+// =====================================================================
+//  SD card
+// =====================================================================
+static SPIClass sdSPI(HSPI);
+
+static bool mountSD() {
+    sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+    sdOK = SD.begin(SD_CS, sdSPI, 25000000);
+    if (sdOK && !SD.exists(FW_DIR)) SD.mkdir(FW_DIR);
+    return sdOK;
+}
+
+// Collect *.bin files under /firmware into `paths` (full path) / `names`.
+static void scanFirmware(std::vector<String>& names, std::vector<String>& paths) {
+    names.clear(); paths.clear();
+    if (!sdOK && !mountSD()) return;
+    File dir = SD.open(FW_DIR);
+    if (!dir) return;
+    for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+        if (f.isDirectory()) { f.close(); continue; }
+        String name = f.name();           // basename on esp32 SD
+        int slash = name.lastIndexOf('/');
+        if (slash >= 0) name = name.substring(slash + 1);
+        String lower = name; lower.toLowerCase();
+        if (lower.endsWith(".bin")) {
+            size_t kb = f.size() / 1024;
+            names.push_back(name + "  (" + String(kb) + "K)");
+            paths.push_back(String(FW_DIR) + "/" + name);
+        }
+        f.close();
+    }
+    dir.close();
+}
+
+static bool extractAppFromSD(File& in, File& out);   // fwd decl (defined below)
+
+// =====================================================================
+//  Flash a firmware .bin from the SD card into ota_0, then reboot.
+//  If the .bin is a full-flash image (e.g. a raw M5Burner/manual copy),
+//  the app partition is extracted on the fly so it still launches.
+// =====================================================================
+static void flashFromSD(const String& path) {
+    File f = SD.open(path);
+    if (!f) { screenMsg("Open failed", path.c_str(), COL_ERR, 2000); return; }
+    size_t sz = f.size();
+    if (sz < 0x2000) { screenMsg("File too small", nullptr, COL_ERR, 2000); f.close(); return; }
+
+    // full-flash image? (partition table magic AA 50 at 0x8000) -> extract app to temp
+    String launchTmp;
+    if (sz > 0x9000) {
+        uint8_t m[2]; f.seek(0x8000);
+        bool full = (f.read(m, 2) == 2 && m[0] == 0xAA && m[1] == 0x50);
+        f.seek(0);
+        if (full) {
+            screenMsg("Preparing app...", nullptr, COL_TXT, 0);
+            launchTmp = String(FW_DIR) + "/.launch.tmp";
+            SD.remove(launchTmp);
+            File of = SD.open(launchTmp, FILE_WRITE);
+            bool ok = of && extractAppFromSD(f, of);
+            if (of) of.close();
+            f.close();
+            if (!ok) { SD.remove(launchTmp); screenMsg("App extract failed", nullptr, COL_ERR, 3000); return; }
+            f = SD.open(launchTmp);
+            if (!f) { SD.remove(launchTmp); screenMsg("Temp open failed", nullptr, COL_ERR, 2500); return; }
+            sz = f.size();
+        }
+    }
+
+    const esp_partition_t* next = esp_ota_get_next_update_partition(NULL);
+    if (!next || sz > next->size) {
+        screenMsg("Too big for ota_0", nullptr, COL_ERR, 2000); f.close(); return;
+    }
+
+    if (!Update.begin(sz, U_FLASH)) {
+        screenMsg("Update.begin failed", Update.errorString(), COL_ERR, 3000);
+        f.close(); return;
+    }
+    Update.onProgress([](size_t cur, size_t tot) { drawProgressBar("Writing to ota_0", cur, tot); });
+    size_t written = Update.writeStream(f);
+    f.close();
+
+    if (written != sz) {
+        screenMsg("Write incomplete", nullptr, COL_ERR, 3000);
+        Update.abort(); return;
+    }
+    if (!Update.end(true)) {            // sets ota_0 as boot partition
+        screenMsg("Finalize failed", Update.errorString(), COL_ERR, 3000);
+        return;
+    }
+    screenMsg("Launching...", "rebooting into firmware", COL_OK, 1200);
+    esp_restart();
+}
+
+// =====================================================================
+//  WiFi
+// =====================================================================
+static bool connectWiFi() {
+    if (WiFi.status() == WL_CONNECTED) return true;
+    String ssid = prefs.getString("ssid", "");
+    String pass = prefs.getString("pass", "");
+    if (ssid.isEmpty()) { screenMsg("No WiFi set", "Settings > WiFi Setup", COL_ERR, 2500); return false; }
+    screenMsg("Connecting WiFi...", ssid.c_str());
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid.c_str(), pass.c_str());
+    uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+        M5Cardputer.update();
+        delay(150);
+    }
+    if (WiFi.status() != WL_CONNECTED) { screenMsg("WiFi failed", nullptr, COL_ERR, 2500); return false; }
+    return true;
+}
+
+// =====================================================================
+//  M5Burner catalog
+//  ---------------------------------------------------------------------
+//  The M5Burner firmware list is a single ~2.2 MB JSON array — far bigger
+//  than RAM. We stream it, split it into individual objects with a brace
+//  counter, keep only category=="cardputer", and write a slim index
+//  (name<TAB>version<TAB>file) to the SD card. The OTA menu then reads
+//  that small file. (Algorithm validated against the live API.)
+// =====================================================================
+
+// Stream the M5Burner catalog and write the slim Cardputer index to SD.
+static bool fetchCatalog() {
+    if (!sdOK && !mountSD()) { screenMsg("No SD card", nullptr, COL_ERR, 2000); return false; }
+    if (!connectWiFi()) return false;
+
+    screenMsg("Fetching catalog...", "from M5Burner");
+    WiFiClientSecure client; client.setInsecure();
+    HTTPClient http;
+    if (!http.begin(client, M5B_LIST)) { screenMsg("HTTP begin failed", nullptr, COL_ERR, 2500); return false; }
+    http.setUserAgent("M5Burner");
+    int code = http.GET();
+    if (code != HTTP_CODE_OK) {
+        screenMsg("Catalog HTTP error", String(code).c_str(), COL_ERR, 3000);
+        http.end(); return false;
+    }
+    WiFiClient* s = http.getStreamPtr();
+
+    SD.remove(CAT_TSV);
+    File out = SD.open(CAT_TSV, FILE_WRITE);
+    if (!out) { http.end(); screenMsg("SD write failed", nullptr, COL_ERR, 2500); return false; }
+
+    // Streaming JSON tokenizer — no large buffer (avoids OOM under TLS).
+    // We only track the fields we need. Strings are captured into a small
+    // fixed token buffer; a string is a KEY if the next non-space char is
+    // ':' else it's a VALUE for the most recent interesting key.
+    int  depth = 0, found = 0, scanned = 0;
+    bool instr = false, esc = false;
+    char tok[96]; int tlen = 0;                 // current string token (truncated, that's fine)
+    bool havePending = false;                   // a completed string awaits key/value classification
+    int  curKey = 0;                            // 1=category 2=name 3=version 4=file (awaiting value)
+    bool isCard = false;
+    String curName, curVer, curFile;
+    uint8_t rb[512];
+    uint32_t lastUI = 0;
+
+    auto classifyKey = [&](const char* k) {
+        if (!strcmp(k, "category")) return 1;
+        if (!strcmp(k, "name"))     return 2;
+        if (!strcmp(k, "version"))  return 3;
+        if (!strcmp(k, "file"))     return 4;
+        return 0;
+    };
+    auto applyValue = [&](const char* v) {
+        switch (curKey) {
+            case 1: { String t = v; t.toLowerCase(); if (t == M5B_CAT) isCard = true; } break;
+            case 2: curName = v; break;
+            case 3: curVer  = v; break;          // last wins == latest version
+            case 4: curFile = v; break;
+        }
+        curKey = 0;
+    };
+
+    while (http.connected() || s->available()) {
+        int n = s->available() ? s->readBytes(rb, sizeof(rb)) : 0;
+        if (n <= 0) { if (!http.connected()) break; delay(2); continue; }
+        for (int i = 0; i < n; i++) {
+            char c = (char)rb[i];
+            if (instr) {                          // inside a string literal
+                if (esc) { if (tlen < 95) tok[tlen++] = c; esc = false; }
+                else if (c == '\\') esc = true;
+                else if (c == '"') { tok[tlen] = 0; havePending = true; instr = false; }
+                else if (tlen < 95) tok[tlen++] = c;
+                continue;
+            }
+            switch (c) {
+                case '"': tlen = 0; instr = true; break;
+                case ':':                          // pending string was a KEY
+                    if (havePending) { curKey = classifyKey(tok); havePending = false; }
+                    break;
+                case '{':
+                    if (depth == 0) { isCard = false; curName = ""; curVer = ""; curFile = ""; curKey = 0; }
+                    depth++; havePending = false; break;
+                case ',':
+                case ']':
+                    if (havePending) { applyValue(tok); havePending = false; } else curKey = 0;
+                    break;
+                case '}':
+                    if (havePending) { applyValue(tok); havePending = false; } else curKey = 0;
+                    if (depth > 0) depth--;
+                    if (depth == 0) {              // end of a top-level entry
+                        scanned++;
+                        if (isCard && curName.length() && curFile.endsWith(".bin")) {
+                            curName.replace('\t', ' '); curName.replace('\n', ' ');
+                            out.printf("%s\t%s\t%s\n", curName.c_str(), curVer.c_str(), curFile.c_str());
+                            found++;
+                        }
+                    }
+                    break;
+            }
+        }
+        if (millis() - lastUI > 250) {            // live progress
+            lastUI = millis();
+            cv.fillScreen(COL_BG);
+            cv.setTextColor(COL_TXT, COL_BG); cv.setTextDatum(middle_center); cv.setTextSize(FONT_BIG);
+            cv.drawString("Fetching catalog", SCR_W / 2, 50);
+            cv.drawString(String(found) + " cardputer", SCR_W / 2, 78);
+            cv.setTextSize(FONT_SMALL); cv.drawString(String(scanned) + " scanned", SCR_W / 2, 104);
+            cv.pushSprite(0, 0);
+        }
+        M5Cardputer.update();
+    }
+    out.close();
+    http.end();
+    screenMsg("Catalog updated", (String(found) + " firmwares").c_str(), COL_OK, 1500);
+    return found > 0;
+}
+
+static uint32_t le32(const uint8_t* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
+
+// Turn a display name into a safe SD filename (no extension).
+static String safeName(const String& name) {
+    String s; for (size_t i = 0; i < name.length() && s.length() < 28; i++) {
+        char c = name[i];
+        if (isalnum((unsigned char)c) || c == '_' || c == '-') s += c;
+        else if (c == ' ') s += '_';
+    }
+    if (s.isEmpty()) s = "fw";
+    return s;
+}
+
+// Download any URL to an SD file, following redirects, with a progress bar.
+static bool downloadURLToFile(const String& url, const String& dst, const char* ua) {
+    WiFiClientSecure client; client.setInsecure();
+    HTTPClient http;
+    http.setUserAgent(ua);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);   // GitHub assets redirect to a CDN
+    if (!http.begin(client, url)) { screenMsg("HTTP begin failed", nullptr, COL_ERR, 2500); return false; }
+    int code = http.GET();
+    if (code != HTTP_CODE_OK) { screenMsg("HTTP error", String(code).c_str(), COL_ERR, 3000); http.end(); return false; }
+
+    int total = http.getSize();
+    WiFiClient* s = http.getStreamPtr();
+    SD.remove(dst);
+    File of = SD.open(dst, FILE_WRITE);
+    if (!of) { http.end(); screenMsg("SD open failed", nullptr, COL_ERR, 2500); return false; }
+
+    uint8_t buf[2048]; uint32_t got = 0; uint32_t lastUI = 0;
+    while (http.connected() || s->available()) {
+        int n = s->available() ? s->readBytes(buf, sizeof(buf)) : 0;
+        if (n <= 0) { if (!http.connected()) break; delay(2); continue; }
+        of.write(buf, n); got += n;
+        if (millis() - lastUI > 200) { lastUI = millis(); drawProgressBar("Downloading", got, total > 0 ? total : 0); }
+        M5Cardputer.update();
+    }
+    of.close(); http.end();
+    if (total > 0 && (int)got < total) { SD.remove(dst); screenMsg("Download incomplete", nullptr, COL_ERR, 3000); return false; }
+    return got > 0;
+}
+
+// Copy exactly the app image out of a full-flash image on the SD card.
+static bool extractAppFromSD(File& in, File& out) {
+    uint8_t pt[512];
+    in.seek(0x8000);
+    if (in.read(pt, sizeof(pt)) != (int)sizeof(pt)) return false;
+    uint32_t appOff = 0;
+    for (int i = 0; i < (int)(sizeof(pt) / 32); i++) {
+        const uint8_t* e = pt + i * 32;
+        if (e[0] != 0xAA || e[1] != 0x50) break;
+        if (e[2] == 0x00) { appOff = le32(e + 4); break; }   // type 0 = app
+    }
+    if (appOff < 0x9000 || appOff >= in.size()) return false;
+    in.seek(appOff);
+    uint8_t hdr[24];
+    if (in.read(hdr, 24) != 24 || hdr[0] != 0xE9) return false;
+    out.write(hdr, 24);
+    int segCount = hdr[1]; bool hashApp = (hdr[23] == 1); uint32_t total = 24;
+    uint8_t buf[2048];
+    for (int seg = 0; seg < segCount; seg++) {
+        uint8_t sh[8];
+        if (in.read(sh, 8) != 8) return false;
+        out.write(sh, 8); total += 8;
+        uint32_t dl = le32(sh + 4);
+        if (dl > 0x400000) return false;
+        while (dl) { int want = dl > sizeof(buf) ? sizeof(buf) : dl; int g = in.read(buf, want); if (g <= 0) return false; out.write(buf, g); total += g; dl -= g; }
+    }
+    total += 1; int pad = (16 - (total % 16)) % 16; int tailN = 1 + pad + (hashApp ? 32 : 0);
+    uint8_t tail[64];
+    if (in.read(tail, tailN) != tailN) return false;
+    out.write(tail, tailN);
+    return true;
+}
+
+// Stream-copy an entire SD file (used when the download is already an app image).
+static bool copySDFile(File& in, File& out) {
+    in.seek(0); uint8_t buf[2048];
+    for (;;) { int g = in.read(buf, sizeof(buf)); if (g <= 0) break; if (out.write(buf, g) != (size_t)g) return false; }
+    return true;
+}
+
+// Download a firmware URL to SD, auto-detect full-image vs app-only, and
+// leave a launchable /firmware/<name>.bin behind.
+static void installFromURL(const String& url, const String& name, const char* ua) {
+    if (!sdOK && !mountSD()) { screenMsg("No SD card", nullptr, COL_ERR, 2000); return; }
+    if (!connectWiFi()) return;
+    screenMsg("Downloading...", name.c_str());
+
+    String tmp = String(FW_DIR) + "/.dl.tmp";
+    if (!downloadURLToFile(url, tmp, ua)) return;
+
+    File in = SD.open(tmp);
+    if (!in) { SD.remove(tmp); screenMsg("Temp open failed", nullptr, COL_ERR, 2500); return; }
+
+    // full-flash image? (partition table magic AA 50 at 0x8000)
+    bool fullImage = false;
+    if (in.size() > 0x9000) { uint8_t m[2]; in.seek(0x8000); if (in.read(m, 2) == 2 && m[0] == 0xAA && m[1] == 0x50) fullImage = true; }
+
+    String path = String(FW_DIR) + "/" + safeName(name) + ".bin";
+    SD.remove(path);
+    File out = SD.open(path, FILE_WRITE);
+    if (!out) { in.close(); SD.remove(tmp); screenMsg("SD open failed", nullptr, COL_ERR, 2500); return; }
+
+    screenMsg(fullImage ? "Extracting app..." : "Saving...", name.c_str());
+    bool ok = fullImage ? extractAppFromSD(in, out) : copySDFile(in, out);
+    out.close(); in.close(); SD.remove(tmp);
+
+    if (ok) screenMsg("Saved to SD!", (safeName(name) + ".bin").c_str(), COL_OK, 2200);
+    else    { SD.remove(path); screenMsg("Install failed", nullptr, COL_ERR, 3000); }
+}
+
+// M5Burner download (always a full-flash image -> app extracted).
+static void downloadToSD(const String& file, const String& name) {
+    installFromURL(String(M5B_CDN) + file, name, "M5Burner");
+}
+
+// ---- GitHub releases --------------------------------------------------
+// Fetch a repo's latest release, list its .bin assets, install the chosen one.
+static void githubInstall() {
+    if (!sdOK && !mountSD()) { screenMsg("No SD card", nullptr, COL_ERR, 2000); return; }
+    String repo = prefs.getString("ghrepo", "pr3y/Bruce");
+    if (!textInput("GitHub owner/repo", repo)) return;
+    prefs.putString("ghrepo", repo);
+    if (!connectWiFi()) return;
+
+    String api = "https://api.github.com/repos/" + repo + "/releases/latest";
+    screenMsg("Fetching release...", repo.c_str());
+    WiFiClientSecure client; client.setInsecure();
+    HTTPClient http;
+    http.setUserAgent("M5CardputerLoader");
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    if (!http.begin(client, api)) { screenMsg("HTTP begin failed", nullptr, COL_ERR, 2500); return; }
+    int code = http.GET();
+    if (code != HTTP_CODE_OK) { screenMsg("GitHub HTTP err", String(code).c_str(), COL_ERR, 3000); http.end(); return; }
+
+    // Stream the release JSON, pulling out browser_download_url values ending in .bin
+    WiFiClient* s = http.getStreamPtr();
+    std::vector<String> urls, labels;
+    String token; bool instr = false, esc = false; bool capUrl = false;
+    const char* KEY = "browser_download_url";
+    while ((http.connected() || s->available()) && urls.size() < 40) {
+        int c = s->read();
+        if (c < 0) { if (!http.connected()) break; delay(2); continue; }
+        char ch = (char)c;
+        if (instr) {
+            if (esc) { token += ch; esc = false; }
+            else if (ch == '\\') esc = true;
+            else if (ch == '"') {
+                instr = false;
+                if (capUrl) { if (token.endsWith(".bin")) { urls.push_back(token); int sl = token.lastIndexOf('/'); labels.push_back(sl >= 0 ? token.substring(sl + 1) : token); } capUrl = false; }
+                else if (token == KEY) capUrl = true;   // next string is the URL value
+            } else if (token.length() < 256) token += ch;
+        } else if (ch == '"') { token = ""; instr = true; }
+    }
+    http.end();
+
+    if (urls.empty()) { screenMsg("No .bin assets", "in latest release", COL_ERR, 3000); return; }
+    int sel = listMenu("GitHub assets", labels, "ENTER=install  `=back");
+    if (sel < 0 || sel >= (int)urls.size()) return;
+    installFromURL(urls[sel], labels[sel].substring(0, labels[sel].lastIndexOf('.')), "M5CardputerLoader");
+}
+
+// OTA menu: show the cached M5Burner Cardputer catalog from SD, refresh,
+// and download the selected firmware (app-extracted) onto the SD card.
+static void otaMenu() {
+    if (!sdOK && !mountSD()) { screenMsg("No SD card", nullptr, COL_ERR, 2000); return; }
+    if (!SD.exists(CAT_TSV)) { if (!fetchCatalog()) return; }
+
+    for (;;) {
+        std::vector<String> names, files;
+        File f = SD.open(CAT_TSV);
+        if (f) {
+            while (f.available()) {
+                String line = f.readStringUntil('\n'); line.trim();
+                if (line.isEmpty()) continue;
+                int t1 = line.indexOf('\t'); int t2 = line.indexOf('\t', t1 + 1);
+                if (t1 < 0 || t2 < 0) continue;
+                String nm = line.substring(0, t1);
+                String ver = line.substring(t1 + 1, t2);
+                String fil = line.substring(t2 + 1);
+                names.push_back(nm + " " + ver);
+                files.push_back(fil);
+            }
+            f.close();
+        }
+
+        std::vector<String> disp;
+        disp.push_back("** Refresh catalog **");
+        disp.push_back("** Install from GitHub **");
+        for (auto& n : names) disp.push_back(n);
+
+        int sel = listMenu("OTA -> SD", disp, "ENTER=get  `=back");
+        if (sel < 0) return;
+        if (sel == 0) { fetchCatalog(); continue; }
+        if (sel == 1) { githubInstall(); continue; }
+        int idx = sel - 2;
+        if (idx < 0 || idx >= (int)files.size()) continue;
+
+        std::vector<String> conf = { String("Download: ") + names[idx], "YES - save to SD", "NO - cancel" };
+        int c = listMenu("Confirm", conf, "ENTER=choose  `=cancel", 1);
+        if (c == 1) {
+            // Free the big catalog vectors BEFORE the TLS download — otherwise
+            // ~544 names in RAM + the canvas starve the mbedTLS handshake (HTTP -1).
+            String selFile = files[idx], selName = names[idx];
+            std::vector<String>().swap(names);
+            std::vector<String>().swap(files);
+            std::vector<String>().swap(disp);
+            downloadToSD(selFile, selName);
+        }
+    }
+}
+
+// =====================================================================
+//  Settings
+// =====================================================================
+static void wifiSetup() {
+    String ssid = prefs.getString("ssid", "");
+    String pass = prefs.getString("pass", "");
+    if (!textInput("WiFi SSID", ssid)) return;
+    if (!textInput("WiFi Password", pass, true)) return;
+    prefs.putString("ssid", ssid);
+    prefs.putString("pass", pass);
+    WiFi.disconnect(true);          // drop any stale session so the new creds are used
+    screenMsg("WiFi saved", ssid.c_str(), COL_OK, 1500);
+}
+
+// Connect and verify connectivity; show IP + signal so you know it works.
+static void wifiTest() {
+    WiFi.disconnect(true);
+    if (!connectWiFi()) return;     // shows its own "WiFi failed" on error
+    std::vector<String> info = {
+        "Connected!",
+        "SSID: " + WiFi.SSID(),
+        "IP:   " + WiFi.localIP().toString(),
+        "RSSI: " + String(WiFi.RSSI()) + " dBm",
+        "GW:   " + WiFi.gatewayIP().toString(),
+    };
+    listMenu("WiFi Test", info, "`=back");
+}
+
+static void settingsMenu() {
+    for (;;) {
+        int bright = prefs.getInt("bright", 128);
+        String wifiState = (WiFi.status() == WL_CONNECTED) ? "connected" : "off";
+        std::vector<String> items = {
+            "WiFi Setup",
+            "WiFi Test (" + wifiState + ")",
+            "Brightness: " + String(bright),
+            "Rescan SD card",
+            String("SD: ") + (sdOK ? "mounted" : "NOT mounted"),
+        };
+        int sel = listMenu("Settings", items, ";.=move ENTER=set `=back");
+        if (sel < 0) return;
+        switch (sel) {
+            case 0: wifiSetup(); break;
+            case 1: wifiTest(); break;
+            case 2: {
+                bright = (bright + 32) % 288;       // 0..256 wrap
+                if (bright > 255) bright = 32;
+                prefs.putInt("bright", bright);
+                g_bright = bright;
+                dsp.setBrightness(bright);
+                break;
+            }
+            case 3: sdOK = false; mountSD();
+                    screenMsg("SD", sdOK ? "mounted" : "mount failed",
+                              sdOK ? COL_OK : COL_ERR, 1200); break;
+            default: break;
+        }
+    }
+}
+
+// =====================================================================
+//  WebUI — host a tiny web page over WiFi to upload/delete SD firmwares
+//  from a browser on your PC/phone. No card removal needed.
+// =====================================================================
+static void webUI() {
+    if (!sdOK && !mountSD()) { screenMsg("No SD card", nullptr, COL_ERR, 2000); return; }
+    if (!connectWiFi()) return;
+
+    WebServer server(80);
+    static File uploadFile;          // static: outlives the upload-callback invocations
+
+    auto pageHTML = []() -> String {
+        String h = "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
+                   "<title>M5Cardputer Loader</title></head><body style='font-family:sans-serif;margin:1em'>"
+                   "<h2>M5Cardputer Loader</h2>"
+                   "<form method='POST' action='/upload' enctype='multipart/form-data'>"
+                   "<input type=file name=f accept='.bin'> <input type=submit value=Upload></form><hr><h3>/firmware</h3><ul>";
+        File dir = SD.open(FW_DIR);
+        for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+            if (!f.isDirectory()) {
+                String n = f.name(); int sl = n.lastIndexOf('/'); if (sl >= 0) n = n.substring(sl + 1);
+                String low = n; low.toLowerCase();
+                if (low.endsWith(".bin"))
+                    h += "<li>" + n + " (" + String((uint32_t)(f.size() / 1024)) + "K) "
+                         "<a href='/delete?f=" + n + "'>[delete]</a></li>";
+            }
+            f.close();
+        }
+        dir.close();
+        h += "</ul><p>Upload app .bin images; they appear under SD Firmware.</p></body></html>";
+        return h;
+    };
+
+    String ip = WiFi.localIP().toString();
+    auto drawInfo = [&ip]() {
+        std::vector<String> info = { "WebUI running", "http://" + ip, "Open in browser to", "upload .bin files", "` = stop" };
+        cv.fillScreen(COL_BG); drawHeader("WebUI Upload");
+        cv.setTextSize(FONT_BIG); cv.setTextColor(COL_TXT, COL_BG); cv.setTextDatum(top_left);
+        int y = LIST_Y + 2; for (auto& l : info) { cv.drawString(l, 6, y); y += ROW_H; }
+        cv.pushSprite(0, 0);
+    };
+    static bool uploadDone = false;
+
+    server.on("/", HTTP_GET, [&server, pageHTML]() { server.send(200, "text/html", pageHTML()); });
+    server.on("/delete", HTTP_GET, [&server]() {
+        if (server.hasArg("f")) SD.remove(String(FW_DIR) + "/" + server.arg("f"));
+        server.sendHeader("Location", "/"); server.send(303, "text/plain", "");
+    });
+    server.on("/upload", HTTP_POST,
+        [&server]() { server.sendHeader("Location", "/"); server.send(303, "text/plain", ""); },
+        [&server]() {
+            HTTPUpload& up = server.upload();
+            if (up.status == UPLOAD_FILE_START) {
+                String fn = up.filename; int sl = fn.lastIndexOf('/'); if (sl >= 0) fn = fn.substring(sl + 1);
+                String low = fn; low.toLowerCase(); if (!low.endsWith(".bin")) fn += ".bin";
+                String p = String(FW_DIR) + "/" + fn;
+                SD.remove(p); uploadFile = SD.open(p, FILE_WRITE);
+                drawProgressBar("Uploading", 0, 0);
+            } else if (up.status == UPLOAD_FILE_WRITE) {
+                if (uploadFile) uploadFile.write(up.buf, up.currentSize);
+                // Content-Length ~= file size (+ small multipart overhead) -> usable progress bar
+                int total = server.header("Content-Length").toInt();
+                drawProgressBar("Uploading", up.totalSize, total > 0 ? total : 0);
+            } else if (up.status == UPLOAD_FILE_END) {
+                if (uploadFile) uploadFile.close();
+                uploadDone = true;
+            }
+        });
+    const char* hdrKeys[] = { "Content-Length" };           // read it in the upload handler for progress
+    server.collectHeaders(hdrKeys, 1);
+    server.begin();
+
+    drawInfo();
+    for (;;) {
+        server.handleClient();
+        if (uploadDone) { uploadDone = false; screenMsg("Uploaded!", nullptr, COL_OK, 1000); drawInfo(); }
+        M5Cardputer.update();
+        if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
+            auto st = M5Cardputer.Keyboard.keysState();
+            bool back = st.del; for (char c : st.word) if (c == '`') back = true;
+            if (back) break;
+        }
+        delay(2);
+    }
+    server.stop();
+    screenMsg("WebUI stopped", nullptr, COL_OK, 800);
+}
+
+static void powerMenu() {
+    for (;;) {
+        int lvl = M5Cardputer.Power.getBatteryLevel();
+        bool chg = M5Cardputer.Power.isCharging();
+        uint32_t ds = g_dimMs / 1000;
+        std::vector<String> items = {
+            String("Battery: ") + (lvl >= 0 ? String(lvl) + "%" : String("n/a")) + (chg ? " (chg)" : ""),
+            String("Auto-dim: ") + (ds ? String(ds) + "s" : String("off")),
+            "Power Off",
+            "Deep Sleep",
+        };
+        int sel = listMenu("Power", items, ";.=move ENTER=set `=back");
+        if (sel < 0) return;
+        if (sel == 1) {                                  // cycle auto-dim timeout
+            const uint32_t opts[] = { 0, 15, 30, 60, 120 }; int cur = 0;
+            for (int i = 0; i < 5; i++) if (opts[i] == ds) cur = i;
+            g_dimMs = opts[(cur + 1) % 5] * 1000;
+            prefs.putUInt("dimms", g_dimMs);
+            lastActivity = millis();
+        } else if (sel == 2) {
+            screenMsg("Powering off...", nullptr, COL_OK, 800); M5Cardputer.Power.powerOff();
+        } else if (sel == 3) {
+            screenMsg("Deep sleep...", "power btn to wake", COL_OK, 800); M5Cardputer.Power.deepSleep();
+        }
+    }
+}
+
+static void aboutScreen() {
+    const esp_partition_t* run = esp_ota_get_running_partition();
+    std::vector<String> info = {
+        "M5Cardputer Loader",
+        "ESP32-S3FN8  8MB flash",
+        "Display 240x135 ST7789V2",
+        String("Running: ") + (run ? run->label : "?"),
+        "SD: /firmware/*.bin",
+        "OTA: M5Burner catalog",
+        "Controls: ; up . down",
+        "ENTER select  ` back",
+#ifdef LOADER_ROLLBACK
+        "Return: RESET (rollback)",
+#else
+        "Return: app loader_return.h",
+#endif
+    };
+    listMenu("About", info, "`=back");
+}
+
+// =====================================================================
+//  Main menu
+// =====================================================================
+
+// Action menu for one installed firmware: Launch / Rename / Delete.
+static void firmwareAction(const String& name, const String& path) {
+    std::vector<String> act = { name, "Launch", "Rename", "Delete", "Cancel" };
+    int a = listMenu("Firmware", act, "ENTER=choose  `=back", 1);
+    if (a == 1) { flashFromSD(path); }
+    else if (a == 2) {                                       // rename
+        String nn = name;
+        int sp = nn.indexOf("  ("); if (sp > 0) nn = nn.substring(0, sp);     // strip "(NNK)" suffix
+        int dot = nn.lastIndexOf('.'); if (dot > 0) nn = nn.substring(0, dot); // strip .bin
+        if (textInput("New name", nn) && nn.length()) {
+            String np = String(FW_DIR) + "/" + safeName(nn) + ".bin";
+            if (SD.rename(path, np)) screenMsg("Renamed", nullptr, COL_OK, 1200);
+            else screenMsg("Rename failed", nullptr, COL_ERR, 2000);
+        }
+    }
+    else if (a == 3) {                                       // delete
+        std::vector<String> conf = { String("Delete ") + name + "?", "YES - delete", "NO - keep" };
+        int c = listMenu("Confirm", conf, "ENTER=choose  `=cancel", 1);
+        if (c == 1) { SD.remove(path); screenMsg("Deleted", nullptr, COL_OK, 1000); }
+    }
+}
+
+void setup() {
+    auto cfg = M5.config();
+    M5Cardputer.begin(cfg, true);
+    dsp.setRotation(1);
+    dsp.setTextSize(1);
+    cv.setColorDepth(8);             // 8-bit halves sprite RAM (32KB) -> more heap for TLS
+    cv.createSprite(SCR_W, SCR_H);   // off-screen buffer for flicker-free drawing
+
+    prefs.begin("loader", false);
+    g_bright = prefs.getInt("bright", 128);
+    g_dimMs  = prefs.getUInt("dimms", 0);
+    lastActivity = millis();
+    dsp.setBrightness(g_bright);
+
+    // If we are an OTA app under a rollback build, the loader (factory)
+    // is never rolled back; nothing to mark here. Loaded apps that omit
+    // esp_ota_mark_app_valid_cancel_rollback() will roll back to us.
+
+    screenMsg("M5Cardputer Loader", "starting...", COL_OK, 600);
+    mountSD();
+}
+
+void loop() {
+    // Installed firmwares come first (each launchable), then the functions.
+    std::vector<String> names, paths;
+    scanFirmware(names, paths);
+    int fwCount = names.size();
+
+    std::vector<String> items = names;            // firmwares at the top
+    const char* funcs[] = { "[OTA Install]", "[WebUI Upload]", "[Power]", "[Settings]", "[About]", "[Reboot]" };
+    for (auto& fn : funcs) items.push_back(fn);
+
+    uint64_t freeMB = sdOK ? (SD.totalBytes() - SD.usedBytes()) / (1024 * 1024) : 0;
+    String footer = fwCount ? (String(fwCount) + " fw  " + String((uint32_t)freeMB) + "MB free")
+                            : "no firmware on SD";
+
+    int sel = listMenu("M5Cardputer Loader", items, footer.c_str());
+    if (sel < 0) return;
+    if (sel < fwCount) { firmwareAction(names[sel], paths[sel]); return; }
+
+    switch (sel - fwCount) {
+        case 0: otaMenu(); break;
+        case 1: webUI(); break;
+        case 2: powerMenu(); break;
+        case 3: settingsMenu(); break;
+        case 4: aboutScreen(); break;
+        case 5: screenMsg("Rebooting...", nullptr, COL_OK, 800); esp_restart(); break;
+        default: break;
+    }
+}
