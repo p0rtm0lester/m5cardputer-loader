@@ -33,6 +33,9 @@
 #include <vector>
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
+#include "esp_flash.h"
+#include "esp_rom_crc.h"
+#include "mbedtls/md5.h"
 
 // ---- M5Cardputer microSD pins (from the hardware spec) --------------
 static const int SD_SCK  = 40;   // G40 CLK
@@ -324,7 +327,6 @@ static void scanFirmware(std::vector<String>& names, std::vector<String>& paths)
     dir.close();
 }
 
-static bool extractAppFromSD(File& in, File& out);   // fwd decl (defined below)
 
 // =====================================================================
 //  Per-firmware persistence
@@ -372,119 +374,175 @@ static bool backupPartition(const char* label, const String& path) {
     return true;
 }
 
-// Restore a saved snapshot into the partition; if no snapshot, erase it (clean slate).
-static bool restorePartition(const char* label, const String& path) {
-    const esp_partition_t* p = dataPart(label);
-    if (!p) return false;
-    esp_partition_erase_range(p, 0, p->size);
-    File f = SD.open(path);
-    if (!f) return true;                                // no saved data -> clean slate
-    uint8_t buf[4096]; uint32_t off = 0;
-    while (off < p->size) {
-        int n = f.read(buf, sizeof(buf));
-        if (n <= 0) break;
-        while (n & 3) buf[n++] = 0xFF;                  // esp_partition_write needs 4-byte alignment
-        if (esp_partition_write(p, off, buf, n) != ESP_OK) break;
-        off += n;
-    }
-    f.close();
-    return true;
-}
-
 // Called at loader boot: snapshot the firmware that just ran back to SD.
+// (Uses the live table, which is the one the launched app booted with.)
 static void persistLastFirmware() {
     String last = prefs.getString("lastfw", "");
     if (last.isEmpty()) return;
+    bool wasFull = prefs.getBool("lastfull", false);
     prefs.remove("lastfw");                             // clear first (avoid loops on failure)
     if (!sdOK && !mountSD()) return;
     SD.mkdir(DATA_DIR);
     String dir = dataDirFor(last);
     SD.mkdir(dir);
-    backupPartition("nvs",    dir + "/nvs.bin");
-    backupPartition("spiffs", dir + "/spiffs.bin");
+    backupPartition("nvs", dir + "/nvs.bin");            // app settings persist across runs
+    if (!wasFull) backupPartition("spiffs", dir + "/spiffs.bin");  // full-image spiffs comes from the image
 }
 
-// Arm a single boot of ota_0 for the custom bootloader hook. Without this,
-// the hook wipes otadata and the loader (factory) boots — so this is what
-// lets the chosen firmware run exactly once, and RESET returns to the loader.
-static void armBootOnce() {
-    const esp_partition_t* bf = dataPart("bootflag");
-    if (!bf) return;
+// =====================================================================
+//  Partition manager + launcher (raw flash; bypasses the partition table
+//  cache, which we are rewriting). Handles two kinds of SD .bin:
+//    full == true  : a full M5Burner-style image (bootloader+table+app+data).
+//                    We lay down the app AND its data partitions (e.g. the
+//                    1.5MB SPIFFS Marauder needs) with matching labels/sizes.
+//    full == false : a raw app image (the .bin IS the app) -> standard layout.
+//  Either way the loader (factory), nvs_ldr and the bootflag are preserved,
+//  so RESET still returns to the loader via the bootloader hook.
+// =====================================================================
+static const uint32_t RESERVED_END = 0x7f0000u;   // coredump start (don't write past here)
+static const uint32_t APP_SLOT_OFF = 0x170000u;   // == end of factory in partitions.csv
+
+static uint32_t rd32f(const uint8_t* p) { return p[0] | (p[1]<<8) | (p[2]<<16) | ((uint32_t)p[3]<<24); }
+
+static void ptEntry(uint8_t* tbl, int n, uint8_t type, uint8_t sub, uint32_t off, uint32_t sz, const char* lbl) {
+    uint8_t* e = tbl + n * 32;
+    e[0]=0xAA; e[1]=0x50; e[2]=type; e[3]=sub;
+    memcpy(e+4,&off,4); memcpy(e+8,&sz,4);
+    memset(e+12,0,16); strncpy((char*)(e+12), lbl, 15); memset(e+28,0,4);
+}
+
+// stream-copy len bytes from SD file f (at src) to raw flash (at dst)
+static bool flashCopySD(File& f, uint32_t src, uint32_t len, uint32_t dst, const char* label) {
+    if (esp_flash_erase_region(NULL, dst, (len + 0xfff) & ~0xfffu) != ESP_OK) return false;
+    f.seek(src);
+    static uint8_t buf[4096]; uint32_t done = 0;
+    while (done < len) {
+        uint32_t want = len - done; if (want > sizeof(buf)) want = sizeof(buf);
+        int g = f.read(buf, want); if (g <= 0) return false;
+        int wl = g; while (wl & 3) buf[wl++] = 0xFF;     // esp_flash_write needs 4-byte length
+        if (esp_flash_write(NULL, buf, dst + done, wl) != ESP_OK) return false;
+        done += g;
+        if ((done & 0x3ffff) == 0 || done >= len) drawProgressBar(label, done, len);
+    }
+    return true;
+}
+
+// restore a per-firmware snapshot file into a raw flash region (erase, then write if present)
+static void restoreSnapshotRaw(const String& path, uint32_t dst, uint32_t partSize) {
+    esp_flash_erase_region(NULL, dst, partSize);
+    File f = SD.open(path);
+    if (!f) return;                                       // no snapshot -> clean slate
+    static uint8_t buf[4096]; uint32_t off = 0;
+    while (off < partSize) {
+        int g = f.read(buf, sizeof(buf)); if (g <= 0) break;
+        int wl = g; while (wl & 3) buf[wl++] = 0xFF;
+        if (esp_flash_write(NULL, buf, dst + off, wl) != ESP_OK) break;
+        off += wl;
+    }
+    f.close();
+}
+
+// set otadata to boot ota_0 + write the boot-once flag (raw flash, table-independent)
+static void armOtaBoot() {
     uint32_t magic = 0xB007A001u;
-    esp_partition_erase_range(bf, 0, bf->size);
-    esp_partition_write(bf, 0, &magic, sizeof(magic));
+    esp_flash_erase_region(NULL, 0xd000, 0x1000);
+    esp_flash_write(NULL, &magic, 0xd000, 4);
+    uint8_t sec[32]; memset(sec, 0xFF, sizeof(sec));
+    uint32_t seq = 1; memcpy(sec, &seq, 4);                // seq 1 -> ota slot 0
+    uint32_t state = 0xFFFFFFFFu; memcpy(sec + 24, &state, 4);
+    uint32_t crc = esp_rom_crc32_le(0xFFFFFFFFu, (const uint8_t*)&seq, 4); memcpy(sec + 28, &crc, 4);
+    esp_flash_erase_region(NULL, 0xe000, 0x2000);
+    esp_flash_write(NULL, sec, 0xe000, 32);
 }
 
-// Called just before launching: restore that firmware's saved state.
-static void restoreFirmwareData(const String& fwId) {
-    if (!sdOK && !mountSD()) return;
+static bool buildAndLaunch(File& f, const String& fwId, bool full) {
+    uint32_t appOff = 0, appLen = 0;
+    struct { uint8_t sub; uint32_t off, sz; char lbl[17]; } data[6]; int nd = 0;
+
+    if (full) {
+        uint8_t ft[0xc00]; f.seek(0x8000);
+        if (f.read(ft, sizeof(ft)) != (int)sizeof(ft)) return false;
+        for (int i = 0; i < (int)(sizeof(ft) / 32); i++) {
+            const uint8_t* e = ft + i * 32; if (e[0] != 0xAA || e[1] != 0x50) break;
+            uint8_t t = e[2], s = e[3]; uint32_t o = rd32f(e + 4), z = rd32f(e + 8);
+            if (t == 0 && !appOff) appOff = o;            // first app partition = the app
+            if (t == 1 && (s == 0x81 || s == 0x82 || s == 0x83) && nd < 6) {  // fat/spiffs/littlefs
+                data[nd].sub = s; data[nd].off = o; data[nd].sz = z;
+                memset(data[nd].lbl, 0, 17); memcpy(data[nd].lbl, e + 12, 16); nd++;
+            }
+        }
+        if (!appOff) return false;
+    }
+    // app image length (walk ESP image header + segments)
+    uint8_t hdr[24]; f.seek(appOff);
+    if (f.read(hdr, 24) != 24 || hdr[0] != 0xE9) return false;
+    int segs = hdr[1]; bool hashapp = (hdr[23] == 1); appLen = 24;
+    for (int s = 0; s < segs; s++) { uint8_t sh[8]; f.seek(appOff + appLen); if (f.read(sh, 8) != 8) return false; appLen += 8 + rd32f(sh + 4); }
+    appLen += 1; if (appLen % 16) appLen += 16 - (appLen % 16); if (hashapp) appLen += 32;
+
+    // keep our fixed prefix (nvs_ldr/bootflag/otadata/factory) from the live table
+    uint8_t cur_tbl[0x200];
+    if (esp_flash_read(NULL, cur_tbl, 0x8000, sizeof(cur_tbl)) != ESP_OK) return false;
+    uint8_t tbl[0x1000]; memset(tbl, 0xFF, sizeof(tbl)); int n = 0;
+    for (int i = 0; i < 8; i++) {
+        const uint8_t* e = cur_tbl + i * 32; if (e[0] != 0xAA || e[1] != 0x50) break;
+        char lbl[17] = {0}; memcpy(lbl, e + 12, 16);
+        if (!strcmp(lbl, "nvs_ldr") || !strcmp(lbl, "bootflag") || !strcmp(lbl, "otadata") || !strcmp(lbl, "factory")) {
+            memcpy(tbl + n * 32, e, 32); n++;
+        }
+    }
+    if (n < 4) return false;
+
+    uint32_t off = APP_SLOT_OFF;
+    uint32_t ota0sz = full ? ((appLen + 0xffff) & ~0xffffu) : 0x610000u;  // app-only keeps the big default slot
+    if (off + ota0sz > RESERVED_END) return false;
+    uint32_t appDst = off; ptEntry(tbl, n++, 0, 0x10, off, ota0sz, "ota_0"); off += ota0sz;
+
+    uint32_t dataDst[6];
+    for (int i = 0; i < nd; i++) { off = (off + 0xfff) & ~0xfffu; if (off + data[i].sz > RESERVED_END) return false;
+        dataDst[i] = off; ptEntry(tbl, n++, 1, data[i].sub, off, data[i].sz, data[i].lbl); off += data[i].sz; }
+
+    uint32_t spiffsDst = 0, spiffsSz = 0;
+    if (!full) { off = (off + 0xfff) & ~0xfffu; spiffsSz = 0x6a000; if (off + spiffsSz > RESERVED_END) return false;
+        spiffsDst = off; ptEntry(tbl, n++, 1, 0x82, off, spiffsSz, "spiffs"); off += spiffsSz; }
+
+    off = (off + 0xfff) & ~0xfffu; if (off + 0x6000 > RESERVED_END) return false;
+    uint32_t nvsDst = off; ptEntry(tbl, n++, 1, 0x02, off, 0x6000, "nvs"); off += 0x6000;
+    ptEntry(tbl, n++, 1, 0x03, RESERVED_END, 0x10000, "coredump");
+
+    uint8_t md5[16]; mbedtls_md5(tbl, n * 32, md5);       // table integrity (bootloader verifies it)
+    uint8_t* m = tbl + n * 32; m[0] = 0xEB; m[1] = 0xEB; memset(m + 2, 0xFF, 14); memcpy(m + 16, md5, 16);
+
+    // ---- commit ----
+    screenMsg("Installing layout...", fwId.c_str());
+    if (esp_flash_erase_region(NULL, 0x8000, 0x1000) != ESP_OK) return false;
+    if (esp_flash_write(NULL, tbl, 0x8000, 0x1000) != ESP_OK) return false;
+    if (!flashCopySD(f, appOff, appLen, appDst, "Installing app")) return false;
+    for (int i = 0; i < nd; i++) if (!flashCopySD(f, data[i].off, data[i].sz, dataDst[i], "Installing data")) return false;
+
     String dir = dataDirFor(fwId);
-    restorePartition("nvs",    dir + "/nvs.bin");
-    restorePartition("spiffs", dir + "/spiffs.bin");
+    restoreSnapshotRaw(dir + "/nvs.bin", nvsDst, 0x6000);              // app settings (persist across runs)
+    if (!full && spiffsSz) restoreSnapshotRaw(dir + "/spiffs.bin", spiffsDst, spiffsSz);
+
+    prefs.putString("lastfw", fwId);
+    prefs.putBool("lastfull", full);
+    armOtaBoot();
+    screenMsg("Launching...", "RESET returns to loader", COL_OK, 1200);
+    esp_restart();
+    return true;
 }
 
-// =====================================================================
-//  Flash a firmware .bin from the SD card into ota_0, then reboot.
-//  If the .bin is a full-flash image (e.g. a raw M5Burner/manual copy),
-//  the app partition is extracted on the fly so it still launches.
-// =====================================================================
 static void flashFromSD(const String& path) {
-    String fwId = fwIdFromPath(path);          // for per-firmware data persistence
+    String fwId = fwIdFromPath(path);
     File f = SD.open(path);
     if (!f) { screenMsg("Open failed", path.c_str(), COL_ERR, 2000); return; }
     size_t sz = f.size();
     if (sz < 0x2000) { screenMsg("File too small", nullptr, COL_ERR, 2000); f.close(); return; }
-
-    // full-flash image? (partition table magic AA 50 at 0x8000) -> extract app to temp
-    String launchTmp;
-    if (sz > 0x9000) {
-        uint8_t m[2]; f.seek(0x8000);
-        bool full = (f.read(m, 2) == 2 && m[0] == 0xAA && m[1] == 0x50);
-        f.seek(0);
-        if (full) {
-            screenMsg("Preparing app...", nullptr, COL_TXT, 0);
-            launchTmp = String(FW_DIR) + "/.launch.tmp";
-            SD.remove(launchTmp);
-            File of = SD.open(launchTmp, FILE_WRITE);
-            bool ok = of && extractAppFromSD(f, of);
-            if (of) of.close();
-            f.close();
-            if (!ok) { SD.remove(launchTmp); screenMsg("App extract failed", nullptr, COL_ERR, 3000); return; }
-            f = SD.open(launchTmp);
-            if (!f) { SD.remove(launchTmp); screenMsg("Temp open failed", nullptr, COL_ERR, 2500); return; }
-            sz = f.size();
-        }
-    }
-
-    const esp_partition_t* next = esp_ota_get_next_update_partition(NULL);
-    if (!next || sz > next->size) {
-        screenMsg("Too big for ota_0", nullptr, COL_ERR, 2000); f.close(); return;
-    }
-
-    if (!Update.begin(sz, U_FLASH)) {
-        screenMsg("Update.begin failed", Update.errorString(), COL_ERR, 3000);
-        f.close(); return;
-    }
-    Update.onProgress([](size_t cur, size_t tot) { drawProgressBar("Writing to ota_0", cur, tot); });
-    size_t written = Update.writeStream(f);
+    bool full = false;                                    // full image? (partition table magic at 0x8000)
+    if (sz > 0x9000) { uint8_t m[2]; f.seek(0x8000); if (f.read(m, 2) == 2 && m[0] == 0xAA && m[1] == 0x50) full = true; }
+    bool ok = buildAndLaunch(f, fwId, full);              // reboots on success
     f.close();
-
-    if (written != sz) {
-        screenMsg("Write incomplete", nullptr, COL_ERR, 3000);
-        Update.abort(); return;
-    }
-    if (!Update.end(true)) {            // sets ota_0 as boot partition (pending-verify under rollback)
-        screenMsg("Finalize failed", Update.errorString(), COL_ERR, 3000);
-        return;
-    }
-    if (!launchTmp.isEmpty()) SD.remove(launchTmp);
-    // per-firmware persistence: remember who we launched, restore its saved state
-    prefs.putString("lastfw", fwId);
-    screenMsg("Loading data...", fwId.c_str());
-    restoreFirmwareData(fwId);
-    armBootOnce();                 // bootloader hook will boot ota_0 once, then RESET -> loader
-    screenMsg("Launching...", "RESET returns to loader", COL_OK, 1200);
-    esp_restart();
+    if (!ok) screenMsg("Launch failed", "incompatible image?", COL_ERR, 3000);
 }
 
 // =====================================================================
@@ -624,8 +682,6 @@ static bool fetchCatalog() {
     return found > 0;
 }
 
-static uint32_t le32(const uint8_t* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
-
 // Turn a display name into a safe SD filename (no extension).
 static String safeName(const String& name) {
     String s; for (size_t i = 0; i < name.length() && s.length() < 28; i++) {
@@ -666,77 +722,23 @@ static bool downloadURLToFile(const String& url, const String& dst, const char* 
     return got > 0;
 }
 
-// Copy exactly the app image out of a full-flash image on the SD card.
-static bool extractAppFromSD(File& in, File& out) {
-    uint8_t pt[512];
-    in.seek(0x8000);
-    if (in.read(pt, sizeof(pt)) != (int)sizeof(pt)) return false;
-    uint32_t appOff = 0;
-    for (int i = 0; i < (int)(sizeof(pt) / 32); i++) {
-        const uint8_t* e = pt + i * 32;
-        if (e[0] != 0xAA || e[1] != 0x50) break;
-        if (e[2] == 0x00) { appOff = le32(e + 4); break; }   // type 0 = app
-    }
-    if (appOff < 0x9000 || appOff >= in.size()) return false;
-    in.seek(appOff);
-    uint8_t hdr[24];
-    if (in.read(hdr, 24) != 24 || hdr[0] != 0xE9) return false;
-    out.write(hdr, 24);
-    int segCount = hdr[1]; bool hashApp = (hdr[23] == 1); uint32_t total = 24;
-    uint8_t buf[2048];
-    for (int seg = 0; seg < segCount; seg++) {
-        uint8_t sh[8];
-        if (in.read(sh, 8) != 8) return false;
-        out.write(sh, 8); total += 8;
-        uint32_t dl = le32(sh + 4);
-        if (dl > 0x400000) return false;
-        while (dl) { int want = dl > sizeof(buf) ? sizeof(buf) : dl; int g = in.read(buf, want); if (g <= 0) return false; out.write(buf, g); total += g; dl -= g; }
-    }
-    total += 1; int pad = (16 - (total % 16)) % 16; int tailN = 1 + pad + (hashApp ? 32 : 0);
-    uint8_t tail[64];
-    if (in.read(tail, tailN) != tailN) return false;
-    out.write(tail, tailN);
-    return true;
-}
-
-// Stream-copy an entire SD file (used when the download is already an app image).
-static bool copySDFile(File& in, File& out) {
-    in.seek(0); uint8_t buf[2048];
-    for (;;) { int g = in.read(buf, sizeof(buf)); if (g <= 0) break; if (out.write(buf, g) != (size_t)g) return false; }
-    return true;
-}
-
-// Download a firmware URL to SD, auto-detect full-image vs app-only, and
-// leave a launchable /firmware/<name>.bin behind.
+// Download a firmware URL to SD and keep the file AS-IS (full image or app).
+// The partition manager (buildAndLaunch) handles either form at launch time —
+// full images keep their bundled data partitions (e.g. Marauder's SPIFFS).
 static void installFromURL(const String& url, const String& name, const char* ua) {
     if (!sdOK && !mountSD()) { screenMsg("No SD card", nullptr, COL_ERR, 2000); return; }
     if (!connectWiFi()) return;
     screenMsg("Downloading...", name.c_str());
 
-    String tmp = String(FW_DIR) + "/.dl.tmp";
-    if (!downloadURLToFile(url, tmp, ua)) return;
-
-    File in = SD.open(tmp);
-    if (!in) { SD.remove(tmp); screenMsg("Temp open failed", nullptr, COL_ERR, 2500); return; }
-
-    // full-flash image? (partition table magic AA 50 at 0x8000)
-    bool fullImage = false;
-    if (in.size() > 0x9000) { uint8_t m[2]; in.seek(0x8000); if (in.read(m, 2) == 2 && m[0] == 0xAA && m[1] == 0x50) fullImage = true; }
-
     String path = String(FW_DIR) + "/" + safeName(name) + ".bin";
+    String tmp  = String(FW_DIR) + "/.dl.tmp";
+    if (!downloadURLToFile(url, tmp, ua)) return;
     SD.remove(path);
-    File out = SD.open(path, FILE_WRITE);
-    if (!out) { in.close(); SD.remove(tmp); screenMsg("SD open failed", nullptr, COL_ERR, 2500); return; }
-
-    screenMsg(fullImage ? "Extracting app..." : "Saving...", name.c_str());
-    bool ok = fullImage ? extractAppFromSD(in, out) : copySDFile(in, out);
-    out.close(); in.close(); SD.remove(tmp);
-
-    if (ok) screenMsg("Saved to SD!", (safeName(name) + ".bin").c_str(), COL_OK, 2200);
-    else    { SD.remove(path); screenMsg("Install failed", nullptr, COL_ERR, 3000); }
+    if (SD.rename(tmp, path)) screenMsg("Saved to SD!", (safeName(name) + ".bin").c_str(), COL_OK, 2200);
+    else { SD.remove(tmp); screenMsg("Install failed", nullptr, COL_ERR, 3000); }
 }
 
-// M5Burner download (always a full-flash image -> app extracted).
+// M5Burner download (full-flash image kept whole; partition-managed at launch).
 static void downloadToSD(const String& file, const String& name) {
     installFromURL(String(M5B_CDN) + file, name, "M5Burner");
 }
