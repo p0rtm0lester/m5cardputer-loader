@@ -32,6 +32,7 @@
 #include <Preferences.h>
 #include <vector>
 #include "esp_ota_ops.h"
+#include "esp_partition.h"
 
 // ---- M5Cardputer microSD pins (from the hardware spec) --------------
 static const int SD_SCK  = 40;   // G40 CLK
@@ -43,10 +44,10 @@ static const int SD_CS   = 12;   // G12 CS
 static const int SCR_W = 240;
 static const int SCR_H = 135;
 static const int HDR_H = 18;
-static const int ROW_H = 20;
+static const int ROW_H = 16;
 static const int FTR_H = 14;
 static const int LIST_Y = HDR_H + 2;
-static const int VISIBLE_ROWS = (SCR_H - HDR_H - FTR_H - 2) / ROW_H;  // ~5 rows
+static const int VISIBLE_ROWS = (SCR_H - HDR_H - FTR_H - 2) / ROW_H;  // ~6 rows at font size 1
 
 // ---- Colors ----------------------------------------------------------
 #define COL_BG     TFT_BLACK
@@ -54,8 +55,9 @@ static const int VISIBLE_ROWS = (SCR_H - HDR_H - FTR_H - 2) / ROW_H;  // ~5 rows
 #define COL_HDRTXT TFT_WHITE
 #define COL_TXT    TFT_WHITE
 #define COL_DIM    TFT_DARKGREY
-#define COL_SEL    0xFD20      // orange
+#define COL_SEL    0xFD20      // orange (selection highlight)
 #define COL_SELTXT TFT_BLACK
+#define COL_FW     0xFD60      // bright orange (firmware list text)
 #define COL_OK     TFT_GREEN
 #define COL_ERR    TFT_RED
 
@@ -70,10 +72,9 @@ static auto& dsp = M5Cardputer.Display;
 static M5Canvas cv(&dsp);          // off-screen frame buffer (double buffering -> no flicker)
 static bool sdOK = false;
 
-// Font sizes (LovyanGFX supports fractional scaling): list/messages a touch
-// under 2 for a slightly smaller look; footer hints at 1 so they fit.
-static const float FONT_BIG = 1.7f;
-static const int   FONT_SMALL = 1;
+// Font sizes: back to the original small-but-readable size 1 everywhere.
+static const int FONT_BIG = 1;
+static const int FONT_SMALL = 1;
 
 // Power / auto-dim state
 static uint32_t lastActivity = 0;
@@ -176,8 +177,11 @@ static void drawProgressBar(const char* label, size_t cur, size_t total) {
 //  Generic scrollable list menu.
 //  Returns selected index, or -1 if the user pressed BACK.
 // =====================================================================
+// fwColor is used for the first `fwCount` (non-selected) rows — e.g. bright
+// orange for the firmware entries on the main screen. Remaining rows use COL_TXT.
 static int listMenu(const char* title, const std::vector<String>& items,
-                    const char* footer, int start = 0) {
+                    const char* footer, int start = 0,
+                    uint16_t fwColor = COL_TXT, int fwCount = 0) {
     int sel = start;
     int top = 0;
     bool redraw = true;
@@ -199,10 +203,11 @@ static int listMenu(const char* title, const std::vector<String>& items,
                 int y = LIST_Y + i * ROW_H;
                 bool on = (idx == sel);
                 if (on) cv.fillRect(0, y, SCR_W, ROW_H, COL_SEL);
-                cv.setTextColor(on ? COL_SELTXT : COL_TXT, on ? COL_SEL : COL_BG);
+                uint16_t fg = (idx < fwCount) ? fwColor : COL_TXT;
+                cv.setTextColor(on ? COL_SELTXT : fg, on ? COL_SEL : COL_BG);
                 cv.setTextDatum(middle_left);
                 String row = items[idx];
-                if (row.length() > 22) row = row.substring(0, 21) + "~";   // ~23 chars fit at 1.7x
+                if (row.length() > 38) row = row.substring(0, 37) + "~";   // ~40 chars fit at size 1
                 cv.drawString(row, 6, y + ROW_H / 2);
             }
             // scroll indicator
@@ -244,14 +249,14 @@ static bool textInput(const char* title, String& out, bool mask = false) {
         cv.setTextSize(FONT_BIG);
         String shown = buf;
         if (mask) { shown = ""; for (size_t i = 0; i < buf.length(); i++) shown += '*'; }
-        // wrap manually (char cell ~10x14 at 1.7x)
+        // wrap manually (char cell ~6x8 at size 1)
         int x = 6, y = LIST_Y + 4;
         for (int i = 0; i < (int)shown.length(); i++) {
             cv.drawChar(shown[i], x, y);
-            x += 10;
-            if (x > SCR_W - 14) { x = 6; y += 16; }
+            x += 6;
+            if (x > SCR_W - 10) { x = 6; y += 11; }
         }
-        cv.fillRect(x, y, 8, 14, COL_SEL);  // cursor
+        cv.fillRect(x, y, 5, 8, COL_SEL);  // cursor
         drawFooter("type  ENTER=ok  `=cancel");
         cv.pushSprite(0, 0);
 
@@ -282,7 +287,22 @@ static bool mountSD() {
     return sdOK;
 }
 
-// Collect *.bin files under /firmware into `paths` (full path) / `names`.
+// Turn an SD filename into a readable display name:
+//   "Bruce.1.2.3.3.tar.bin" -> "Bruce 1.2.3.3"   "NEMO_v3.bin" -> "NEMO v3"
+static String prettyName(String fn) {
+    int slash = fn.lastIndexOf('/'); if (slash >= 0) fn = fn.substring(slash + 1);
+    String low = fn; low.toLowerCase();
+    if (low.endsWith(".bin")) { fn = fn.substring(0, fn.length() - 4); low = fn; low.toLowerCase(); }
+    const char* tails[] = { ".tar", ".gz", ".zip", ".xz", ".elf" };  // strip archive/junk tails
+    for (const char* t : tails) { int p = low.indexOf(t); if (p >= 0) { fn = fn.substring(0, p); break; } }
+    fn.replace('_', ' ');
+    while (fn.indexOf("  ") >= 0) fn.replace("  ", " ");
+    fn.trim();
+    if (fn.isEmpty()) fn = "firmware";
+    return fn;
+}
+
+// Collect *.bin files under /firmware into `paths` (full path) / `names` (pretty).
 static void scanFirmware(std::vector<String>& names, std::vector<String>& paths) {
     names.clear(); paths.clear();
     if (!sdOK && !mountSD()) return;
@@ -293,10 +313,10 @@ static void scanFirmware(std::vector<String>& names, std::vector<String>& paths)
         String name = f.name();           // basename on esp32 SD
         int slash = name.lastIndexOf('/');
         if (slash >= 0) name = name.substring(slash + 1);
+        if (name.startsWith(".")) { f.close(); continue; }   // skip hidden/temp (.dl.tmp etc.)
         String lower = name; lower.toLowerCase();
         if (lower.endsWith(".bin")) {
-            size_t kb = f.size() / 1024;
-            names.push_back(name + "  (" + String(kb) + "K)");
+            names.push_back(prettyName(name));
             paths.push_back(String(FW_DIR) + "/" + name);
         }
         f.close();
@@ -307,11 +327,109 @@ static void scanFirmware(std::vector<String>& names, std::vector<String>& paths)
 static bool extractAppFromSD(File& in, File& out);   // fwd decl (defined below)
 
 // =====================================================================
+//  Per-firmware persistence
+//  ---------------------------------------------------------------------
+//  Each firmware keeps its own internal-flash state (the app "nvs" + the
+//  "spiffs" partitions) in /firmware/data/<fwId>/. On launch we restore
+//  that firmware's snapshot into flash; on return (the loader boots after
+//  a RESET/rollback) we snapshot the partitions back. Files apps write
+//  straight to the SD card persist on their own (shared filesystem).
+// =====================================================================
+#define DATA_DIR "/firmware/data"
+
+static String fwIdFromPath(const String& path) {       // basename without .bin
+    String b = path; int sl = b.lastIndexOf('/'); if (sl >= 0) b = b.substring(sl + 1);
+    int dot = b.lastIndexOf('.'); if (dot > 0) b = b.substring(0, dot);
+    return b;
+}
+static String dataDirFor(const String& fwId) { return String(DATA_DIR) + "/" + fwId; }
+
+static const esp_partition_t* dataPart(const char* label) {
+    return esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, label);
+}
+
+// Is the partition effectively empty (first 4KB all 0xFF)? Skip backing those up.
+static bool partitionLooksEmpty(const esp_partition_t* p) {
+    uint8_t buf[256];
+    if (esp_partition_read(p, 0, buf, sizeof(buf)) != ESP_OK) return true;
+    for (uint8_t b : buf) if (b != 0xFF) return false;
+    return true;
+}
+
+static bool backupPartition(const char* label, const String& path) {
+    const esp_partition_t* p = dataPart(label);
+    if (!p) return false;
+    if (partitionLooksEmpty(p)) { SD.remove(path); return true; }   // nothing to save
+    File f = SD.open(path, FILE_WRITE);
+    if (!f) return false;
+    uint8_t buf[4096];
+    for (uint32_t off = 0; off < p->size; off += sizeof(buf)) {
+        uint32_t n = p->size - off; if (n > sizeof(buf)) n = sizeof(buf);
+        if (esp_partition_read(p, off, buf, n) != ESP_OK) { f.close(); SD.remove(path); return false; }
+        f.write(buf, n);
+    }
+    f.close();
+    return true;
+}
+
+// Restore a saved snapshot into the partition; if no snapshot, erase it (clean slate).
+static bool restorePartition(const char* label, const String& path) {
+    const esp_partition_t* p = dataPart(label);
+    if (!p) return false;
+    esp_partition_erase_range(p, 0, p->size);
+    File f = SD.open(path);
+    if (!f) return true;                                // no saved data -> clean slate
+    uint8_t buf[4096]; uint32_t off = 0;
+    while (off < p->size) {
+        int n = f.read(buf, sizeof(buf));
+        if (n <= 0) break;
+        while (n & 3) buf[n++] = 0xFF;                  // esp_partition_write needs 4-byte alignment
+        if (esp_partition_write(p, off, buf, n) != ESP_OK) break;
+        off += n;
+    }
+    f.close();
+    return true;
+}
+
+// Called at loader boot: snapshot the firmware that just ran back to SD.
+static void persistLastFirmware() {
+    String last = prefs.getString("lastfw", "");
+    if (last.isEmpty()) return;
+    prefs.remove("lastfw");                             // clear first (avoid loops on failure)
+    if (!sdOK && !mountSD()) return;
+    SD.mkdir(DATA_DIR);
+    String dir = dataDirFor(last);
+    SD.mkdir(dir);
+    backupPartition("nvs",    dir + "/nvs.bin");
+    backupPartition("spiffs", dir + "/spiffs.bin");
+}
+
+// Arm a single boot of ota_0 for the custom bootloader hook. Without this,
+// the hook wipes otadata and the loader (factory) boots — so this is what
+// lets the chosen firmware run exactly once, and RESET returns to the loader.
+static void armBootOnce() {
+    const esp_partition_t* bf = dataPart("bootflag");
+    if (!bf) return;
+    uint32_t magic = 0xB007A001u;
+    esp_partition_erase_range(bf, 0, bf->size);
+    esp_partition_write(bf, 0, &magic, sizeof(magic));
+}
+
+// Called just before launching: restore that firmware's saved state.
+static void restoreFirmwareData(const String& fwId) {
+    if (!sdOK && !mountSD()) return;
+    String dir = dataDirFor(fwId);
+    restorePartition("nvs",    dir + "/nvs.bin");
+    restorePartition("spiffs", dir + "/spiffs.bin");
+}
+
+// =====================================================================
 //  Flash a firmware .bin from the SD card into ota_0, then reboot.
 //  If the .bin is a full-flash image (e.g. a raw M5Burner/manual copy),
 //  the app partition is extracted on the fly so it still launches.
 // =====================================================================
 static void flashFromSD(const String& path) {
+    String fwId = fwIdFromPath(path);          // for per-firmware data persistence
     File f = SD.open(path);
     if (!f) { screenMsg("Open failed", path.c_str(), COL_ERR, 2000); return; }
     size_t sz = f.size();
@@ -355,11 +473,17 @@ static void flashFromSD(const String& path) {
         screenMsg("Write incomplete", nullptr, COL_ERR, 3000);
         Update.abort(); return;
     }
-    if (!Update.end(true)) {            // sets ota_0 as boot partition
+    if (!Update.end(true)) {            // sets ota_0 as boot partition (pending-verify under rollback)
         screenMsg("Finalize failed", Update.errorString(), COL_ERR, 3000);
         return;
     }
-    screenMsg("Launching...", "rebooting into firmware", COL_OK, 1200);
+    if (!launchTmp.isEmpty()) SD.remove(launchTmp);
+    // per-firmware persistence: remember who we launched, restore its saved state
+    prefs.putString("lastfw", fwId);
+    screenMsg("Loading data...", fwId.c_str());
+    restoreFirmwareData(fwId);
+    armBootOnce();                 // bootloader hook will boot ota_0 once, then RESET -> loader
+    screenMsg("Launching...", "RESET returns to loader", COL_OK, 1200);
     esp_restart();
 }
 
@@ -918,8 +1042,8 @@ static void firmwareAction(const String& name, const String& path) {
     int a = listMenu("Firmware", act, "ENTER=choose  `=back", 1);
     if (a == 1) { flashFromSD(path); }
     else if (a == 2) {                                       // rename
-        String nn = name;
-        int sp = nn.indexOf("  ("); if (sp > 0) nn = nn.substring(0, sp);     // strip "(NNK)" suffix
+        String nn = path;                                    // derive editable base from the real filename
+        int sl = nn.lastIndexOf('/'); if (sl >= 0) nn = nn.substring(sl + 1);
         int dot = nn.lastIndexOf('.'); if (dot > 0) nn = nn.substring(0, dot); // strip .bin
         if (textInput("New name", nn) && nn.length()) {
             String np = String(FW_DIR) + "/" + safeName(nn) + ".bin";
@@ -942,7 +1066,8 @@ void setup() {
     cv.setColorDepth(8);             // 8-bit halves sprite RAM (32KB) -> more heap for TLS
     cv.createSprite(SCR_W, SCR_H);   // off-screen buffer for flicker-free drawing
 
-    prefs.begin("loader", false);
+    prefs.begin("loader", false, "nvs_ldr");   // loader's OWN nvs partition (apps can't clobber it)
+    WiFi.persistent(false);                     // keep WiFi creds out of the app "nvs" partition
     g_bright = prefs.getInt("bright", 128);
     g_dimMs  = prefs.getUInt("dimms", 0);
     lastActivity = millis();
@@ -954,6 +1079,7 @@ void setup() {
 
     screenMsg("M5Cardputer Loader", "starting...", COL_OK, 600);
     mountSD();
+    persistLastFirmware();   // snapshot the firmware that just ran (per-firmware data)
 }
 
 void loop() {
@@ -962,15 +1088,16 @@ void loop() {
     scanFirmware(names, paths);
     int fwCount = names.size();
 
-    std::vector<String> items = names;            // firmwares at the top
-    const char* funcs[] = { "[OTA Install]", "[WebUI Upload]", "[Power]", "[Settings]", "[About]", "[Reboot]" };
+    std::vector<String> items = names;            // firmwares at the top (drawn bright orange)
+    const char* funcs[] = { "-  OTA Install  -", "-  WebUI Upload  -", "-  Power  -",
+                            "-  Settings  -", "-  About  -", "-  Reboot  -" };
     for (auto& fn : funcs) items.push_back(fn);
 
     uint64_t freeMB = sdOK ? (SD.totalBytes() - SD.usedBytes()) / (1024 * 1024) : 0;
     String footer = fwCount ? (String(fwCount) + " fw  " + String((uint32_t)freeMB) + "MB free")
                             : "no firmware on SD";
 
-    int sel = listMenu("M5Cardputer Loader", items, footer.c_str());
+    int sel = listMenu("M5Cardputer Loader", items, footer.c_str(), 0, COL_FW, fwCount);
     if (sel < 0) return;
     if (sel < fwCount) { firmwareAction(names[sel], paths[sel]); return; }
 

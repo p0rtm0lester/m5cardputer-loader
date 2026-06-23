@@ -1,23 +1,23 @@
 # M5Cardputer Loader partition table  (ESP32-S3, 8MB / 0x800000 flash)
 # ---------------------------------------------------------------------
-#  factory : the LOADER firmware (this project). Always the boot fallback.
-#  ota_0   : the "runtime slot". Selected firmware is copied here and run.
-#  spiffs  : small scratch FS (loader settings backup, optional).
+#  nvs_ldr : LOADER's own config (wifi, brightness, last-fw). Isolated.
+#  bootflag: 1 sector the loader sets to request a one-shot boot of ota_0.
+#            The custom bootloader hook reads it: if set -> boot ota_0 once
+#            and clear it; if not set -> wipe otadata so the LOADER (factory)
+#            always boots. This defeats app self-validation (e.g. Bruce),
+#            so RESET always returns to the loader.
+#  otadata : boot selection.
+#  factory : the LOADER firmware. Always the boot target unless bootflag set.
+#  ota_0   : the runtime slot (selected firmware copied here, then run).
+#  nvs     : the APP's NVS  (snapshotted per-firmware to /firmware/data/<fw>/).
+#  spiffs  : the APP's FS   (snapshotted per-firmware).
 #  coredump: crash dumps.
-#
-#  How launching works:
-#    running from factory -> esp_ota_get_next_update_partition() == ota_0
-#    Update.writeStream() streams the SD .bin into ota_0
-#    Update.end(true)     sets ota_0 as the boot partition -> reboot.
-#  Returning to the loader:
-#    - rollback build: app never marks itself valid -> reset rolls back to factory
-#    - normal build  : app includes include/loader_return.h and calls returnToLoader()
-#
-#  ota_0 is 6MB so it fits large apps (DOOM, UiFlow2, Marauder, etc.).
 # Name,     Type, SubType,  Offset,    Size
-nvs,        data, nvs,      0x9000,    0x5000
+nvs_ldr,    data, nvs,      0x9000,    0x4000
+bootflag,   data, 0x40,     0xd000,    0x1000
 otadata,    data, ota,      0xe000,    0x2000
-factory,    app,  factory,  0x10000,   0x180000
-ota_0,      app,  ota_0,    0x190000,  0x600000
-spiffs,     data, spiffs,   0x790000,  0x60000
+factory,    app,  factory,  0x10000,   0x160000
+ota_0,      app,  ota_0,    0x170000,  0x610000
+nvs,        data, nvs,      0x780000,  0x6000
+spiffs,     data, spiffs,   0x786000,  0x6a000
 coredump,   data, coredump, 0x7f0000,  0x10000
