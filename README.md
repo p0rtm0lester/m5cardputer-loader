@@ -27,7 +27,11 @@ Inspired by [bmorcelli/Launcher](https://github.com/bmorcelli/Launcher) and
 - **Per‑firmware persistence** — each firmware keeps its own internal state
   (NVS + SPIFFS) across runs; files apps write to the SD card persist naturally.
 - **Settings** — WiFi (SSID/pass in an isolated NVS), WiFi test, brightness, SD rescan.
-- **Power** — battery %, auto‑dim timeout, power off / deep sleep.
+- **Power** — live battery voltage/%/charge‑state, a header battery glyph (fill =
+  level, colour = green > 50 % / orange 30–50 % / red < 30 %, ⚡ when charging),
+  two‑stage idle blanking (**dim**, then **screen off**, both timeouts configurable),
+  power off / deep sleep. The battery readout updates live (~1 s) while a screen is
+  shown. See *Power & charging* below.
 
 ### Controls
 `;` up · `.` down · `ENTER` select · `` ` `` or `Backspace` back.
@@ -36,8 +40,36 @@ Inspired by [bmorcelli/Launcher](https://github.com/bmorcelli/Launcher) and
 
 ## Hardware (research summary)
 ESP32‑S3FN8, dual‑core LX7 @240 MHz, **8 MB flash, no PSRAM**; ST7789V2 240×135;
-56‑key keyboard; microSD on SPI **CS=G12 MOSI=G14 CLK=G40 MISO=G39**; G0 = the
-user button (also the boot strapping pin — *don't hold it at power‑on*).
+56‑key keyboard (Cardputer **ADV** = TCA8418 I2C @0x34 on G8/G9; original = GPIO
+matrix); microSD on SPI **CS=G12 MOSI=G14 CLK=G40 MISO=G39**; battery via ADC on
+**G10** (×2.0, calibrated); G0 = the user button (also the boot strapping pin —
+*don't hold it at power‑on*).
+
+---
+
+## Power & charging
+
+The Cardputer/ADV has **no PMIC**. The charger is a **TP4057** — a dumb standalone
+Li‑Po charger with **no I2C, no enable pin, and no status output**. So:
+
+- **Firmware cannot enable, set, or read charging.** `M5Unified` reports the board
+  as `pmic_adc`; `isCharging()` returns *unknown* and `setChargeCurrent()` etc. are
+  no‑ops. The only battery signal is the **ADC voltage** (G10).
+- **Charge current is hardware‑fixed at ~62 mA** and the **switch must be ON** to
+  charge (off physically disconnects the cell).
+- Powered on, the device draws **~300 mA**, so on a weak supply (hub / PC port /
+  thin cable) the system load eats everything and the battery **nets zero** — looks
+  like "not charging." Measured: a **laptop USB port does not net‑charge it even in
+  low‑power mode**; a **5 V ≥1 A wall charger does** (~+120 mV/hr while idle).
+
+What the loader does to help: idles the CPU at **80 MHz** (boosts to 240 MHz only
+for WiFi/downloads), and at the screen‑off idle stage drops to **40 MHz** with the
+backlight off — minimising the load that competes with the 62 mA charge.
+
+**To charge:** use a real wall charger, switch ON, and **leave it idle** so the
+screen blanks. Watching it (screen on) keeps it from gaining. The charge indicator
+infers state from a 90 s voltage trend (the only method possible on this hardware),
+so ⚡ appears within a minute or two of a genuine rise.
 
 ---
 
@@ -48,11 +80,16 @@ nvs_ldr   0x009000  16 KB   loader's OWN config (isolated from apps)
 bootflag  0x00d000   4 KB   one-shot boot flag (read by the bootloader hook)
 otadata   0x00e000   8 KB   boot selection
 factory   0x010000 1.4 MB   the LOADER (this project)
-ota_0     0x170000 6.06 MB  runtime slot (selected firmware runs here)
-nvs       0x780000  24 KB   app NVS    (snapshotted per-firmware)
-spiffs    0x786000 424 KB   app FS     (snapshotted per-firmware)
+ota_0     0x170000 4.5 MB   runtime slot (selected firmware runs here)
+spiffs    0x5f0000 1.5 MB   app FS     (snapshotted per-firmware)
+nvs       0x770000  24 KB   app NVS    (snapshotted per-firmware)
+ota_1     0x780000 448 KB   STUB — must exist or ESP32Marauder smashes its stack
 coredump  0x7f0000  64 KB
 ```
+
+`ota_1` is never launched into; it exists only because ESP32Marauder's boot‑time
+OTA‑partition lookup needs a second app slot (see *Known limitation*). Launches
+still target `ota_0` (`esp_ota_get_next_update_partition()` from `factory` returns it).
 
 ---
 
@@ -113,11 +150,21 @@ manages it: `/firmware/_m5cat.tsv` (cached M5Burner index) and
 
 ## Known limitation
 
-Firmwares that need their **own data partition** (e.g. UIFlow, or some Marauder
-builds that expect a specific SPIFFS/partition layout) may not run when launched
-from `ota_0`, because the live partition table is the loader's. Self‑contained
-apps (Bruce, NEMO, most tools) work fine. A future "partition‑manager" mode could
-rewrite the table per‑firmware to cover these.
+Firmwares that need their **own large data partition** at a fixed offset (e.g.
+UIFlow, or builds whose bundled SPIFFS is larger than our 1.5 MB `spiffs`) may not
+run when launched from `ota_0`, because the live partition table is the loader's.
+Self‑contained apps (Bruce, NEMO, Evil‑Cardputer, ESP32Marauder, most tools) work
+fine. A future "partition‑manager" mode could rewrite the table per‑firmware.
+
+> **ESP32Marauder note:** Marauder's boot‑time OTA‑partition lookup hard‑requires
+> a *second* app slot to exist, or it smashes its own stack on boot (it crashes
+> identically even flashed standalone with a single‑OTA table). The partition
+> table therefore keeps a small stub `ota_1` (448 KB) purely so that lookup
+> succeeds — we never launch into it, and `esp_ota_get_next_update_partition()`
+> from the loader still resolves to `ota_0`, so launches are unaffected. Install
+> the **`m5cardputer_adv`** asset (the I2C‑keyboard build); the plain
+> `m5cardputer` build targets the original GPIO‑matrix keyboard and its keys
+> won't respond on the ADV.
 
 ---
 

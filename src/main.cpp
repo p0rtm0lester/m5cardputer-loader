@@ -22,6 +22,7 @@
 // =====================================================================
 
 #include <M5Cardputer.h>
+#include "esp32-hal-cpu.h"   // setCpuFrequencyMhz (lower idle draw so the charger wins)
 #include <SD.h>
 #include <SPI.h>
 #include <Update.h>
@@ -51,15 +52,73 @@ static const int VISIBLE_ROWS = (SCR_H - HDR_H - FTR_H - 2) / ROW_H;  // ~6 rows
 
 // ---- Colors ----------------------------------------------------------
 #define COL_BG     TFT_BLACK
-#define COL_HDR    0x051D      // deep blue
-#define COL_HDRTXT TFT_WHITE
+#define COL_HDR    TFT_BLACK   // header/footer bar bg (black; set off by a green rule)
+#define COL_HDRTXT 0x07E0      // bright terminal green (header/footer text)
+#define COL_RULE   0x05C0      // green divider rule under header / over footer
 #define COL_TXT    TFT_WHITE
 #define COL_DIM    TFT_DARKGREY
-#define COL_SEL    0xFD20      // orange (selection highlight)
+#define COL_SEL    0xFD20      // amber (selection highlight bar) — pairs with green header
 #define COL_SELTXT TFT_BLACK
 #define COL_FW     0xFD60      // bright orange (firmware list text)
 #define COL_OK     TFT_GREEN
 #define COL_ERR    TFT_RED
+#define COL_WARN   0xFD20      // orange (battery 30-50%)
+
+// Battery % color: >50 green, 30-50 orange, <30 red.
+static inline uint16_t battColor(int lvl) {
+    return lvl > 50 ? COL_OK : (lvl >= 30 ? COL_WARN : COL_ERR);
+}
+
+// ---- Battery / charging tracking -----------------------------------------
+// The Cardputer (ADV) has NO PMIC: battery is read as a calibrated ADC voltage
+// and charging is done by a fixed hardware charger with no status line. So we
+// can't ask "am I charging?" — we infer it from the voltage trend (rising =
+// charging, pinned high = charged) and map voltage -> % through a Li-Po curve
+// (more accurate + far less jumpy than the library's single-sample linear %).
+static int      g_battMv   = 0;     // smoothed battery mV (displayed value)
+static int      g_battBase = 0;     // trend baseline mV (rolled each window)
+static int      g_battPct  = -1;    // state-of-charge %
+static int      g_chgState = 0;     // 0 = discharging, 1 = charging, 2 = charged/full
+static uint32_t g_battNext = 0;     // next sample time (ms)
+static uint32_t g_baseNext = 0;     // next trend-evaluation time (ms)
+
+// Single-cell Li-Po voltage(mV) -> % (piecewise-linear; light-load curve).
+static int lipoPct(int mv) {
+    static const int V[] = {3300,3500,3600,3700,3750,3800,3850,3900,3950,4000,4100,4200};
+    static const int P[] = {   0,  10,  20,  35,  45,  55,  62,  70,  78,  85,  95, 100};
+    const int N = sizeof(V) / sizeof(V[0]);
+    if (mv <= V[0])   return 0;
+    if (mv >= V[N-1]) return 100;
+    for (int i = 1; i < N; i++)
+        if (mv < V[i]) return P[i-1] + (P[i]-P[i-1]) * (mv - V[i-1]) / (V[i] - V[i-1]);
+    return 100;
+}
+
+// Sample (averaged) battery voltage, smooth it, and infer charge state from trend.
+static void updatePower(bool force = false) {
+    uint32_t now = millis();
+    if (!force && (int32_t)(now - g_battNext) < 0) return;
+    g_battNext = now + 2000;                          // sample every 2s
+    int acc = 0, n = 0;
+    for (int i = 0; i < 16; i++) { int v = M5Cardputer.Power.getBatteryVoltage(); if (v > 0) { acc += v; n++; } }
+    if (!n) return;
+    int mv = acc / n;
+    if (g_battMv == 0) { g_battMv = g_battBase = mv; g_baseNext = now + 90000; }  // prime
+    g_battMv  = (g_battMv * 3 + mv) / 4;              // light smoothing for the displayed value
+    g_battPct = lipoPct(g_battMv);
+    // Charge trend over a fixed ~90s window (truncation-free): the charger is so
+    // slow (~2-3 mV/min) that we compare the smoothed voltage to a baseline rolled
+    // every 90s rather than an EMA delta (which lost sub-1mV steps to int rounding).
+    if ((int32_t)(now - g_baseNext) >= 0) {
+        int delta = g_battMv - g_battBase;
+        if (g_battMv >= 4180 && delta >= -2) g_chgState = 2;   // pinned high -> charged
+        else if (delta >  2) g_chgState = 1;                   // rose -> charging
+        else if (delta < -2) g_chgState = 0;                   // fell -> discharging
+        // |delta|<=2: flat (e.g. laptop holding it steady) -> keep last state
+        g_battBase = g_battMv;
+        g_baseNext = now + 90000;
+    }
+}
 
 #define FW_DIR   "/firmware"
 #define CAT_TSV  "/firmware/_m5cat.tsv"     // cached slim M5Burner catalog (name<TAB>version<TAB>file)
@@ -79,8 +138,9 @@ static const int FONT_SMALL = 1;
 
 // Power / auto-dim state
 static uint32_t lastActivity = 0;
-static bool     dimmed = false;
-static uint32_t g_dimMs = 0;       // 0 = auto-dim off
+static uint8_t  dimState = 0;       // 0 = normal, 1 = dimmed, 2 = screen off (launcher idle)
+static uint32_t g_dimMs = 120000;   // idle -> dim         (0 = never)
+static uint32_t g_offMs = 300000;   // idle -> screen off  (0 = never)
 static uint8_t  g_bright = 128;
 
 // =====================================================================
@@ -90,12 +150,18 @@ enum Nav { N_NONE, N_UP, N_DOWN, N_ENTER, N_BACK };
 
 static Nav pollNav() {
     M5Cardputer.update();
+    updatePower();                          // throttled battery/charge sampling
     bool changed = M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed();
     if (changed) {
         lastActivity = millis();
-        if (dimmed) { dsp.setBrightness(g_bright); dimmed = false; return N_NONE; }  // first key just wakes
+        if (dimState) { setCpuFrequencyMhz(80); dsp.setBrightness(g_bright); dimState = 0; return N_NONE; }  // wake screen + clock
     } else {
-        if (g_dimMs && !dimmed && millis() - lastActivity > g_dimMs) { dsp.setBrightness(8); dimmed = true; }
+        uint32_t idle = millis() - lastActivity;        // two-stage idle blanking (launcher only)
+        if (g_offMs && idle > g_offMs) {                // screen off + deep-idle 40MHz (lowest draw -> charges fastest)
+            if (dimState != 2) { dsp.setBrightness(0); setCpuFrequencyMhz(40); dimState = 2; }
+        } else if (g_dimMs && idle > g_dimMs) {         // dim
+            if (dimState != 1) { dsp.setBrightness(8); dimState = 1; }
+        }
         return N_NONE;
     }
     auto st = M5Cardputer.Keyboard.keysState();
@@ -123,19 +189,33 @@ static void drawHeader(const char* title) {
     cv.setTextDatum(middle_left);
     cv.setTextSize(FONT_BIG);
     cv.drawString(title, 4, HDR_H / 2);
-    // battery indicator (shown on every screen that has a header)
-    int lvl = M5Cardputer.Power.getBatteryLevel();
-    if (lvl >= 0) {
-        bool chg = M5Cardputer.Power.isCharging();
-        cv.setTextDatum(middle_right);
+    // battery indicator: glyph (fill = %, color = level) + bolt when charging.
+    updatePower();                                   // throttled; keeps the reading fresh
+    int pct = g_battPct;
+    if (pct >= 0) {
+        uint16_t col = (g_chgState ? COL_OK : battColor(pct));   // green while on charger
+        const int bw = 18, bh = 10, nub = 2;
+        int bx = SCR_W - 3 - nub - bw;               // battery body, right-aligned
+        int by = (HDR_H - bh) / 2;
+        cv.drawRect(bx, by, bw, bh, col);
+        cv.fillRect(bx + bw, by + 3, nub, bh - 6, col);          // + terminal nub
+        int fw = (bw - 4) * pct / 100; if (fw > 0) cv.fillRect(bx + 2, by + 2, fw, bh - 4, col);
+        if (g_chgState == 1) {                       // charging -> lightning bolt
+            int cx = bx + bw / 2, cy = by + bh / 2;
+            cv.fillTriangle(cx + 2, by + 1, cx - 3, cy + 1, cx + 1, cy, TFT_YELLOW);
+            cv.fillTriangle(cx - 1, cy, cx + 3, cy - 1, cx - 2, by + bh - 1, TFT_YELLOW);
+        }
+        cv.setTextDatum(middle_right);               // % to the left of the icon
         cv.setTextSize(FONT_SMALL);
-        cv.setTextColor(chg ? COL_OK : COL_HDRTXT, COL_HDR);
-        cv.drawString((chg ? "+" : "") + String(lvl) + "%", SCR_W - 3, HDR_H / 2);
+        cv.setTextColor(col, COL_HDR);
+        cv.drawString(String(pct) + "%", bx - 3, HDR_H / 2);
     }
+    cv.drawFastHLine(0, HDR_H - 1, SCR_W, COL_RULE); // green rule separates header from body
 }
 
 static void drawFooter(const char* hint) {
     cv.fillRect(0, SCR_H - FTR_H, SCR_W, FTR_H, COL_HDR);
+    cv.drawFastHLine(0, SCR_H - FTR_H, SCR_W, COL_RULE);  // green rule over footer
     cv.setTextColor(COL_HDRTXT, COL_HDR);
     cv.setTextDatum(middle_left);
     cv.setTextSize(FONT_SMALL);
@@ -180,17 +260,24 @@ static void drawProgressBar(const char* label, size_t cur, size_t total) {
 // =====================================================================
 // fwColor is used for the first `fwCount` (non-selected) rows — e.g. bright
 // orange for the firmware entries on the main screen. Remaining rows use COL_TXT.
+// `provider`, if given, is called on each (re)draw to rebuild the rows — used for
+// live menus (e.g. Power shows updating battery/voltage). Static menus pass none.
 static int listMenu(const char* title, const std::vector<String>& items,
                     const char* footer, int start = 0,
-                    uint16_t fwColor = COL_TXT, int fwCount = 0) {
+                    uint16_t fwColor = COL_TXT, int fwCount = 0,
+                    std::vector<String> (*provider)() = nullptr) {
     int sel = start;
     int top = 0;
     bool redraw = true;
-    if (items.empty()) {
+    std::vector<String> dyn;
+    if (provider) dyn = provider();
+    const std::vector<String>& L = provider ? dyn : items;   // live-refreshable source
+    if (L.empty()) {
         screenMsg(title, "(empty) - press ` to go back");
         while (pollNav() != N_BACK) delay(10);
         return -1;
     }
+    uint32_t nextTick = millis() + 1000;     // periodic redraw so live data (battery) updates
     for (;;) {
         if (sel < top) top = sel;
         if (sel >= top + VISIBLE_ROWS) top = sel - VISIBLE_ROWS + 1;
@@ -199,7 +286,7 @@ static int listMenu(const char* title, const std::vector<String>& items,
             cv.fillScreen(COL_BG);
             drawHeader(title);
             cv.setTextSize(FONT_BIG);
-            for (int i = 0; i < VISIBLE_ROWS && (top + i) < (int)items.size(); i++) {
+            for (int i = 0; i < VISIBLE_ROWS && (top + i) < (int)L.size(); i++) {
                 int idx = top + i;
                 int y = LIST_Y + i * ROW_H;
                 bool on = (idx == sel);
@@ -207,15 +294,15 @@ static int listMenu(const char* title, const std::vector<String>& items,
                 uint16_t fg = (idx < fwCount) ? fwColor : COL_TXT;
                 cv.setTextColor(on ? COL_SELTXT : fg, on ? COL_SEL : COL_BG);
                 cv.setTextDatum(middle_left);
-                String row = items[idx];
+                String row = L[idx];
                 if (row.length() > 38) row = row.substring(0, 37) + "~";   // ~40 chars fit at size 1
                 cv.drawString(row, 6, y + ROW_H / 2);
             }
             // scroll indicator
-            if ((int)items.size() > VISIBLE_ROWS) {
+            if ((int)L.size() > VISIBLE_ROWS) {
                 int trackY = LIST_Y, trackH = VISIBLE_ROWS * ROW_H;
-                int knobH = trackH * VISIBLE_ROWS / items.size();
-                int knobY = trackY + trackH * top / items.size();
+                int knobH = trackH * VISIBLE_ROWS / L.size();
+                int knobY = trackY + trackH * top / L.size();
                 cv.fillRect(SCR_W - 3, trackY, 3, trackH, COL_DIM);
                 cv.fillRect(SCR_W - 3, knobY, 3, knobH, COL_SEL);
             }
@@ -226,11 +313,17 @@ static int listMenu(const char* title, const std::vector<String>& items,
 
         Nav n = pollNav();
         switch (n) {
-            case N_UP:    sel = (sel - 1 + items.size()) % items.size(); redraw = true; break;
-            case N_DOWN:  sel = (sel + 1) % items.size();                redraw = true; break;
+            case N_UP:    sel = (sel - 1 + L.size()) % L.size(); redraw = true; break;
+            case N_DOWN:  sel = (sel + 1) % L.size();            redraw = true; break;
             case N_ENTER: return sel;
             case N_BACK:  return -1;
             default: break;
+        }
+        // periodic live refresh (battery icon + provider rows) while idle; skip when screen off
+        if (dimState != 2 && (int32_t)(millis() - nextTick) >= 0) {
+            nextTick = millis() + 1000;
+            if (provider) { dyn = provider(); if (sel >= (int)dyn.size()) sel = (int)dyn.size() - 1; }
+            redraw = true;
         }
         delay(8);
     }
@@ -288,15 +381,73 @@ static bool mountSD() {
     return sdOK;
 }
 
-// Turn an SD filename into a readable display name:
-//   "Bruce.1.2.3.3.tar.bin" -> "Bruce 1.2.3.3"   "NEMO_v3.bin" -> "NEMO v3"
+// Known firmwares: if the (lowercased) filename contains `key`, show `label`.
+// Most specific keys first. Build/board/date tokens in the filename are ignored.
+struct FwAlias { const char* key; const char* label; };
+static const FwAlias FW_ALIASES[] = {
+    {"marauder",       "Marauder"},
+    {"ghostesp",       "GhostESP"},
+    {"ghost",          "GhostESP"},
+    {"porkchop",       "Porkchop"},
+    {"bruce",          "Bruce"},
+    {"nemo",           "NEMO"},
+    {"evil",           "Evil-Cardputer"},
+    {"ultimateremote", "UltimateRemote"},
+    {"ultimate",       "UltimateRemote"},
+    {"poseidon",       "Poseidon"},
+    {"killerhack",     "KillerHack"},
+    {"raisinghell",    "Raising Hell"},
+    {"raising",        "Raising Hell"},
+    {"bit-pirate",     "Bit-Pirate"},
+    {"bitpirate",      "Bit-Pirate"},
+    {"uiflow",         "UIFlow"},
+    {"launcher",       "M5Launcher"},
+};
+
+// Pull a clean version like "1.12.3" out of a filename. Prefers a 'v<digit>'
+// marker; skips date/build groups (a run of >4 digits, e.g. 20260622). "" if none.
+static String extractVersion(const String& low) {
+    int n = low.length(), start = -1;
+    for (int i = 0; i + 1 < n; i++)                       // explicit 'v' + digit
+        if (low[i] == 'v' && isdigit((unsigned char)low[i + 1]) &&
+            (i == 0 || !isalnum((unsigned char)low[i - 1]))) { start = i + 1; break; }
+    if (start < 0)                                        // else a digit just after a separator
+        for (int i = 1; i < n; i++)
+            if (isdigit((unsigned char)low[i]) &&
+                (low[i-1]=='.'||low[i-1]=='_'||low[i-1]==' '||low[i-1]=='-')) { start = i; break; }
+    if (start < 0) return "";
+    String ver; int groups = 0, i = start;
+    while (i < n && groups < 4) {
+        int j = i; while (j < n && isdigit((unsigned char)low[j])) j++;
+        int len = j - i;
+        if (len == 0 || len > 4) break;                   // 0 = not a number, >4 = date/build
+        if (groups) ver += ".";
+        ver += low.substring(i, j);
+        groups++;
+        if (j < n && (low[j]=='.'||low[j]=='_') && j+1 < n && isdigit((unsigned char)low[j+1])) i = j + 1;
+        else break;
+    }
+    return ver;
+}
+
+// Turn an SD filename into a readable display name. Recognizes known firmwares
+// by keyword ("...marauder_v1_12_3..." -> "Marauder 1.12.3"); otherwise tidies
+// the raw name ("NEMO_v3.bin" -> "NEMO v3").
 static String prettyName(String fn) {
     int slash = fn.lastIndexOf('/'); if (slash >= 0) fn = fn.substring(slash + 1);
     String low = fn; low.toLowerCase();
     if (low.endsWith(".bin")) { fn = fn.substring(0, fn.length() - 4); low = fn; low.toLowerCase(); }
     const char* tails[] = { ".tar", ".gz", ".zip", ".xz", ".elf" };  // strip archive/junk tails
-    for (const char* t : tails) { int p = low.indexOf(t); if (p >= 0) { fn = fn.substring(0, p); break; } }
-    fn.replace('_', ' ');
+    for (const char* t : tails) { int p = low.indexOf(t); if (p >= 0) { fn = fn.substring(0, p); low = fn; low.toLowerCase(); break; } }
+
+    for (const FwAlias& a : FW_ALIASES) {                 // known firmware -> clean label (+ version)
+        if (low.indexOf(a.key) >= 0) {
+            String ver = extractVersion(low), out = a.label;
+            if (ver.length()) out += " " + ver;
+            return out;
+        }
+    }
+    fn.replace('_', ' ');                                  // fallback: tidy the raw name
     while (fn.indexOf("  ") >= 0) fn.replace("  ", " ");
     fn.trim();
     if (fn.isEmpty()) fn = "firmware";
@@ -522,6 +673,7 @@ static void flashFromSD(const String& path) {
 // =====================================================================
 static bool connectWiFi() {
     if (WiFi.status() == WL_CONNECTED) return true;
+    setCpuFrequencyMhz(240);   // full speed for WiFi/TLS; loop() drops back to 80 when idle
     String ssid = prefs.getString("ssid", "");
     String pass = prefs.getString("pass", "");
     if (ssid.isEmpty()) { screenMsg("No WiFi set", "Settings > WiFi Setup", COL_ERR, 2500); return false; }
@@ -763,12 +915,16 @@ static void githubInstall() {
 
 // OTA menu: show the cached M5Burner Cardputer catalog from SD, refresh,
 // and download the selected firmware (app-extracted) onto the SD card.
+static String g_catFilter;          // session search term for the OTA catalog (empty = show all)
+
 static void otaMenu() {
     if (!sdOK && !mountSD()) { screenMsg("No SD card", nullptr, COL_ERR, 2000); return; }
     if (!SD.exists(CAT_TSV)) { if (!fetchCatalog()) return; }
 
     for (;;) {
         std::vector<String> names, files;
+        String flt = g_catFilter; flt.toLowerCase();
+        int total = 0;
         File f = SD.open(CAT_TSV);
         if (f) {
             while (f.available()) {
@@ -779,6 +935,8 @@ static void otaMenu() {
                 String nm = line.substring(0, t1);
                 String ver = line.substring(t1 + 1, t2);
                 String fil = line.substring(t2 + 1);
+                total++;
+                if (flt.length()) { String hay = nm; hay.toLowerCase(); if (hay.indexOf(flt) < 0) continue; }
                 names.push_back(nm + " " + ver);
                 files.push_back(fil);
             }
@@ -788,13 +946,29 @@ static void otaMenu() {
         std::vector<String> disp;
         disp.push_back("** Refresh catalog **");
         disp.push_back("** Install from GitHub **");
+        disp.push_back(g_catFilter.length() ? String("** Filter: ") + g_catFilter + " **"
+                                            : String("** Search... **"));
+        const int HDR = 3;
         for (auto& n : names) disp.push_back(n);
 
-        int sel = listMenu("OTA -> SD", disp, "ENTER=get  `=back");
+        String title = g_catFilter.length() ? String(names.size()) + "/" + total + " match"
+                                            : String("OTA -> SD (") + total + ")";
+        int sel = listMenu(title.c_str(), disp, "ENTER=get  `=back");
         if (sel < 0) return;
-        if (sel == 0) { fetchCatalog(); continue; }
-        if (sel == 1) { githubInstall(); continue; }
-        int idx = sel - 2;
+        if (sel <= 1) {                                   // network actions (refresh / GitHub):
+            // free the ~544-entry catalog RAM FIRST, else the TLS handshake OOMs (HTTP -1).
+            std::vector<String>().swap(names);
+            std::vector<String>().swap(files);
+            std::vector<String>().swap(disp);
+            if (sel == 0) fetchCatalog(); else githubInstall();
+            continue;
+        }
+        if (sel == 2) {                                   // search/filter (blank = clear)
+            String q = g_catFilter;
+            if (textInput("Search (blank=all)", q)) { q.trim(); g_catFilter = q; }
+            continue;
+        }
+        int idx = sel - HDR;
         if (idx < 0 || idx >= (int)files.size()) continue;
 
         std::vector<String> conf = { String("Download: ") + names[idx], "YES - save to SD", "NO - cancel" };
@@ -959,28 +1133,49 @@ static void webUI() {
     screenMsg("WebUI stopped", nullptr, COL_OK, 800);
 }
 
+// Format an idle timeout (ms) compactly: 0->"off", whole minutes->"Nm", else "Ns".
+static String fmtIdle(uint32_t ms) {
+    if (!ms) return "off";
+    uint32_t s = ms / 1000;
+    return (s % 60 == 0) ? String(s / 60) + "m" : String(s) + "s";
+}
+
+// Live Power-menu rows (re-pulled ~1x/sec by listMenu so battery/voltage update).
+static std::vector<String> powerRows() {
+    updatePower();
+    const char* st = g_chgState == 1 ? "charging" : g_chgState == 2 ? "charged" : "on battery";
+    return {
+        String("Battery: ") + (g_battPct >= 0 ? String(g_battPct) + "%" : String("n/a")),
+        String("Voltage: ") + String(g_battMv) + " mV",
+        String("State:   ") + st,
+        String("Dim after:  ") + fmtIdle(g_dimMs),
+        String("Screen off: ") + fmtIdle(g_offMs),
+        "Power Off",
+        "Deep Sleep",
+    };
+}
+
 static void powerMenu() {
+    int start = 0;
     for (;;) {
-        int lvl = M5Cardputer.Power.getBatteryLevel();
-        bool chg = M5Cardputer.Power.isCharging();
-        uint32_t ds = g_dimMs / 1000;
-        std::vector<String> items = {
-            String("Battery: ") + (lvl >= 0 ? String(lvl) + "%" : String("n/a")) + (chg ? " (chg)" : ""),
-            String("Auto-dim: ") + (ds ? String(ds) + "s" : String("off")),
-            "Power Off",
-            "Deep Sleep",
-        };
-        int sel = listMenu("Power", items, ";.=move ENTER=set `=back");
+        int sel = listMenu("Power", powerRows(), ";.=move ENTER=set `=back", start, COL_TXT, 0, powerRows);
         if (sel < 0) return;
-        if (sel == 1) {                                  // cycle auto-dim timeout
-            const uint32_t opts[] = { 0, 15, 30, 60, 120 }; int cur = 0;
-            for (int i = 0; i < 5; i++) if (opts[i] == ds) cur = i;
-            g_dimMs = opts[(cur + 1) % 5] * 1000;
+        start = sel;                                     // keep position across setting changes
+        if (sel == 3) {                                  // cycle idle -> dim timeout
+            const uint32_t opts[] = { 0, 30, 60, 120, 180, 300 }; int cur = 0;
+            for (int i = 0; i < 6; i++) if (opts[i] * 1000 == g_dimMs) cur = i;
+            g_dimMs = opts[(cur + 1) % 6] * 1000;
             prefs.putUInt("dimms", g_dimMs);
-            lastActivity = millis();
-        } else if (sel == 2) {
+            lastActivity = millis(); dimState = 0; dsp.setBrightness(g_bright);
+        } else if (sel == 4) {                           // cycle idle -> screen-off timeout
+            const uint32_t opts[] = { 0, 60, 120, 300, 600, 900 }; int cur = 0;
+            for (int i = 0; i < 6; i++) if (opts[i] * 1000 == g_offMs) cur = i;
+            g_offMs = opts[(cur + 1) % 6] * 1000;
+            prefs.putUInt("offms", g_offMs);
+            lastActivity = millis(); dimState = 0; dsp.setBrightness(g_bright);
+        } else if (sel == 5) {
             screenMsg("Powering off...", nullptr, COL_OK, 800); M5Cardputer.Power.powerOff();
-        } else if (sel == 3) {
+        } else if (sel == 6) {
             screenMsg("Deep sleep...", "power btn to wake", COL_OK, 800); M5Cardputer.Power.deepSleep();
         }
     }
@@ -1043,9 +1238,13 @@ void setup() {
     prefs.begin("loader", false, "nvs_ldr");   // loader's OWN nvs partition (apps can't clobber it)
     WiFi.persistent(false);                     // keep WiFi creds out of the app "nvs" partition
     g_bright = prefs.getInt("bright", 128);
-    g_dimMs  = prefs.getUInt("dimms", 0);
+    g_dimMs  = prefs.getUInt("dimms", 120000);   // dim after 2 min idle (configurable)
+    g_offMs  = prefs.getUInt("offms", 300000);   // screen off after 5 min idle (configurable)
     lastActivity = millis();
     dsp.setBrightness(g_bright);
+    setCpuFrequencyMhz(80);   // idle at 80MHz: the UI needs no more, and the lower draw
+                              // lets the ~62mA hardware charger out-pace the system load
+    updatePower(true);                          // prime battery reading before first draw
 
     // If we are an OTA app under a rollback build, the loader (factory)
     // is never rolled back; nothing to mark here. Loaded apps that omit
@@ -1057,6 +1256,7 @@ void setup() {
 }
 
 void loop() {
+    if (getCpuFrequencyMhz() != 80) setCpuFrequencyMhz(80);  // back to low-power idle after WiFi/downloads
     // Installed firmwares come first (each launchable), then the functions.
     std::vector<String> names, paths;
     scanFirmware(names, paths);

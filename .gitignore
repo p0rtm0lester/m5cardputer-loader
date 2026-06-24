@@ -1,6 +1,7 @@
+# build output
 .pio/
-.piovenv/
 bl_build/
-sdkconfig.*
-CMakeLists.txt
-.dummy/
+*.o
+*.elf
+__pycache__/
+*.pyc
