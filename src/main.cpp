@@ -362,7 +362,7 @@ static bool backupPartition(const char* label, const String& path) {
     if (partitionLooksEmpty(p)) { SD.remove(path); return true; }   // nothing to save
     File f = SD.open(path, FILE_WRITE);
     if (!f) return false;
-    uint8_t buf[4096];
+    static uint8_t buf[4096];
     for (uint32_t off = 0; off < p->size; off += sizeof(buf)) {
         uint32_t n = p->size - off; if (n > sizeof(buf)) n = sizeof(buf);
         if (esp_partition_read(p, off, buf, n) != ESP_OK) { f.close(); SD.remove(path); return false; }
@@ -389,12 +389,6 @@ static void persistLastFirmware() {
 
 static uint32_t rd32f(const uint8_t* p) { return p[0] | (p[1]<<8) | (p[2]<<16) | ((uint32_t)p[3]<<24); }
 
-// TEMP self-test marker: write a 4-byte value into the coredump partition (esp_partition).
-static void markCD(uint32_t off, uint32_t val) {
-    const esp_partition_t* p = dataPart("coredump");
-    if (p) esp_partition_write(p, off, &val, 4);
-}
-
 // Restore a per-firmware snapshot into its partition (esp_partition; clean if none).
 static void restorePartition(const char* label, const String& path) {
     const esp_partition_t* p = dataPart(label);
@@ -402,7 +396,7 @@ static void restorePartition(const char* label, const String& path) {
     esp_partition_erase_range(p, 0, p->size);
     File f = SD.open(path);
     if (!f) return;                                       // no snapshot -> erased/clean
-    uint8_t buf[4096]; uint32_t off = 0;
+    static uint8_t buf[4096]; uint32_t off = 0;
     while (off < p->size) {
         int g = f.read(buf, sizeof(buf)); if (g <= 0) break;
         while (g & 3) buf[g++] = 0xFF;
@@ -428,7 +422,7 @@ static bool writeImagePartition(File& f, uint32_t src, uint32_t len, const char*
     if (len > p->size) len = p->size;
     esp_partition_erase_range(p, 0, p->size);
     f.seek(src);
-    uint8_t buf[4096]; uint32_t done = 0;
+    static uint8_t buf[4096]; uint32_t done = 0;
     while (done < len) {
         uint32_t want = len - done; if (want > sizeof(buf)) want = sizeof(buf);
         int g = f.read(buf, want); if (g <= 0) return false;
@@ -453,7 +447,7 @@ static bool buildAndLaunch(File& f, const String& fwId, bool full) {
     struct { uint8_t sub; uint32_t off, sz; char lbl[17]; } data[6]; int nd = 0;
 
     screenMsg("Preparing launch...", full ? "full image" : "app image", COL_OK, 500);
-    { const esp_partition_t* cd = dataPart("coredump"); if (cd) esp_partition_erase_range(cd, 0, 0x1000); }  // TEMP test
+    int dataTooBig = 0;
     if (full) {
         static uint8_t ft[0xc00]; f.seek(0x8000);
         if (f.read(ft, sizeof(ft)) != (int)sizeof(ft)) { screenMsg("Bad image (table)", nullptr, COL_ERR, 3000); return false; }
@@ -467,6 +461,9 @@ static bool buildAndLaunch(File& f, const String& fwId, bool full) {
             }
         }
         if (!appOff) { screenMsg("Bad image (no app)", nullptr, COL_ERR, 3000); return false; }
+        // warn if a bundled data partition is bigger than ours (its FS won't mount)
+        for (int i = 0; i < nd; i++) { const esp_partition_t* dp = dataPart(data[i].lbl); if (dp && data[i].sz > dp->size) dataTooBig = data[i].sz / 1024; }
+        if (dataTooBig) screenMsg("Warning: data too big", (String(dataTooBig) + "K - may not run").c_str(), COL_ERR, 2500);
     }
     // app image length (walk ESP image header + segments)
     uint8_t hdr[24]; f.seek(appOff);
@@ -481,7 +478,7 @@ static bool buildAndLaunch(File& f, const String& fwId, bool full) {
     if (!Update.begin(appLen, U_FLASH)) { screenMsg("Update.begin failed", Update.errorString(), COL_ERR, 3500); return false; }
     Update.onProgress([](size_t c, size_t t) { drawProgressBar("Installing app", c, t); });
     f.seek(appOff);
-    uint8_t buf[4096]; uint32_t done = 0;
+    static uint8_t buf[4096]; uint32_t done = 0;     // static: keep the 4KB buffer off the 8KB task stack
     while (done < appLen) {
         uint32_t want = appLen - done; if (want > sizeof(buf)) want = sizeof(buf);
         int g = f.read(buf, want); if (g <= 0) break;
@@ -502,7 +499,6 @@ static bool buildAndLaunch(File& f, const String& fwId, bool full) {
     prefs.putString("lastfw", fwId);
     prefs.putBool("lastfull", full);
     armBootOnce();
-    markCD(0, 0xA5A5A5A5);   // TEMP test: buildAndLaunch completed with no crash
     screenMsg("Launching...", "RESET returns to loader", COL_OK, 1200);
     esp_restart();
     return true;
@@ -1039,8 +1035,6 @@ static void firmwareAction(const String& name, const String& path) {
 void setup() {
     auto cfg = M5.config();
     M5Cardputer.begin(cfg, true);
-    Serial.begin(115200);
-    Serial.println("\n=== LOADER BOOT ===");
     dsp.setRotation(1);
     dsp.setTextSize(1);
     cv.setColorDepth(8);             // 8-bit halves sprite RAM (32KB) -> more heap for TLS
@@ -1060,9 +1054,6 @@ void setup() {
     screenMsg("M5Cardputer Loader", "starting...", COL_OK, 600);
     mountSD();
     persistLastFirmware();   // snapshot the firmware that just ran (per-firmware data)
-
-    // TEMP self-test marker: if we've already auto-tested, we booted the LOADER (not the app)
-    if (prefs.getBool("atest2", false)) markCD(16, 0x5A5A5A5A);
 }
 
 void loop() {
@@ -1070,14 +1061,6 @@ void loop() {
     std::vector<String> names, paths;
     scanFirmware(names, paths);
     int fwCount = names.size();
-
-    // ---- TEMP self-test: auto-launch the first firmware once (SD mounted here) ----
-    if (sdOK && !paths.empty() && !prefs.getBool("atest2", false)) {
-        prefs.putBool("atest2", true);
-        screenMsg("SELFTEST launch", names[0].c_str(), COL_OK, 800);
-        flashFromSD(paths[0]);     // -> buildAndLaunch (reboots on success)
-    }
-    // ---- end self-test ----
 
     std::vector<String> items = names;            // firmwares at the top (drawn bright orange)
     const char* funcs[] = { "-  OTA Install  -", "-  WebUI Upload  -", "-  Power  -",
