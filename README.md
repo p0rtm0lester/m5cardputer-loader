@@ -184,3 +184,18 @@ platformio.ini                            app build config
 - [M5Cardputer hardware docs](https://docs.m5stack.com/en/core/Cardputer)
 - [bmorcelli/Launcher](https://github.com/bmorcelli/Launcher)
 - [tobozo/M5Stack-SD-Updater](https://github.com/tobozo/M5Stack-SD-Updater)
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE). © 2026 p0rtm0lester.
+
+## Acknowledgements
+
+Inspired by [bmorcelli/Launcher](https://github.com/bmorcelli/Launcher) (MIT,
+© 2023 shikarunochi) and [tobozo/M5Stack-SD-Updater](https://github.com/tobozo/M5Stack-SD-Updater).
+Third-party license notices are reproduced in
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). Build-time libraries
+(M5Unified, M5GFX, M5Cardputer, arduino-esp32, ESP-IDF) are pulled by PlatformIO
+and keep their own licenses.

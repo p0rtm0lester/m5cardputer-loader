@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 p0rtm0lester
 # Flash the M5Cardputer Loader.
 #   ./flash-all.sh app    -> flash ONLY the loader app (0x10000). Fast; for app-code changes.
 #                            The hooked bootloader + partitions stay untouched.

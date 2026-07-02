@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 p0rtm0lester
 # Build the custom M5Cardputer Loader bootloader (with the boot-once hook) STANDALONE.
 #
 # Why: pioarduino's `framework = arduino` flow always flashes a PREBUILT bootloader and

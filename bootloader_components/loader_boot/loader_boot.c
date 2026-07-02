@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 p0rtm0lester
 // =====================================================================
 //  M5Cardputer Loader — custom bootloader hook ("boot-once" flag)
 // ---------------------------------------------------------------------
