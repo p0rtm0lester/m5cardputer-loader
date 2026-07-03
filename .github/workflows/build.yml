@@ -1,0 +1,49 @@
+name: build
+
+# Compile the loader on every push/PR so regressions are caught in CI rather than
+# only on-device. This builds the app (the part that changes constantly). The hooked
+# bootloader is built locally via ./build-bootloader.sh — CI'ing it needs the ESP-IDF
+# bootloader subproject (framework-espidf), which the arduino env doesn't install; a
+# dedicated espidf setup for that is a follow-up.
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+  workflow_dispatch:   # allow manual runs (e.g. to validate the pipeline on a fork)
+
+jobs:
+  app:
+    name: Build loader app (pio run -e cardputer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            pio-${{ runner.os }}-
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Build
+        run: pio run -e cardputer
+
+      - name: Upload firmware artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: |
+            .pio/build/cardputer/firmware.bin
+            .pio/build/cardputer/partitions.bin
+          if-no-files-found: warn
